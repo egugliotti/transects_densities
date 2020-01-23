@@ -1,0 +1,156 @@
+---
+title: "OkeanosHD-VLC"
+output: html_document
+---
+## File Names to Run Times
+This code will create a data frame from your Okeanos HD video file names that has your:  
+* File Path
+* File Name
+* DateTime in UTC (for every second of video)
+* RunTime (as 0 to a number like 360 assigned to each second of video, this is needed to grab the screenshot from VLC using the video run time)
+```{r}
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(dplyr)
+
+# Set working directory to wherever the HD video files are located
+setwd("C:/Users/elizabeth.gugliotti/Desktop/ERDAP/Okeanos test")
+
+# Create a vector using that file path for later
+filepath<-"C:/Users/elizabeth.gugliotti/Desktop/ERDAP/Okeanos test"
+
+# This creates a vector of your file names in that working directory
+files<-list.files()
+
+filex<-unlist(str_split(files,"_",n=5)) # unlist and break string apart by underscore
+x<-matrix(filex,ncol=5,byrow=TRUE) # create a matrix
+colnames(x)<-c("Dive","Vid","DateTime", "yo","yo1") # add column names
+x<-data.frame(x) # make x a data frame
+
+# Break apart the DateTime column in x into the year, month, day, hour, minutes, seconds
+year<-substr(x$DateTime ,1,4)
+month<-substr(x$DateTime ,5,6)
+day<-substr(x$DateTime ,7,8)
+hr<-substr(x$DateTime ,10,11)
+mints<-substr(x$DateTime ,12,13)
+secs<-substr(x$DateTime ,14,15)
+
+# Turn this into a DateTime format
+DT<-ISOdatetime(year=year, month=month, day=day, hour=hr, min=mints, sec=secs, tz="UTC")
+# you will have to manually insert the end time of your final video. I didn't do that here so i just cut out the last 5 minutes. Honestly it should be when the rov is back on deck so you could probably just omit that last video anyways so you don't have to manually enter it in.
+
+NextDT<-DT[2:3] #create vector that is n+1
+
+#starttime + ((next starttime - starttime) -1) = end time
+EndDT<-DT[1:2]+ difftime(NextDT, DT[1:2],units="secs")-1
+StartDT<-DT[1:2] #Need vector that is a length of 2 just for this exercise
+path<- rep(filepath,length(StartDT)) # Make vector that is the filepath repeated for every row (necessary for VLC conversion)
+files<-files[1:2] #Need vector that is length of 2 for this exercise
+
+all<-do.call("cbind",list(path,files, as.character(StartDT),as.character(EndDT))) #use do.call with cbind to combine multiple vectors into one dataframe
+colnames(all)<-c("Path","Files","StartDT","EndDT")
+all<-data.frame(all)
+# You should bind DT (start time), EndDT, your file names, and file paths
+# Your file paths should be your working directory which I created a vector called "filepath" and your file names should be the same ones as the "files" vector above
+
+# Even though I put is as.character, it came out as a factor so I need to convert it to a POSIXct class
+all$StartDT<-as.POSIXct(all$StartDT)
+all$EndDT<-as.POSIXct(all$EndDT)
+
+# Create empty data frame
+video.df <- data.frame(Path = character(),
+                 File = character(),
+                 DateTime = as.POSIXct(character()),
+                 RunTime=numeric(),
+                 stringsAsFactors=FALSE)
+
+# Create the loop
+for (id in all$Files){
+  x<- seq.POSIXt(all$StartDT[all$Files==id], all$EndDT[all$Files==id], units="seconds", by= 1)
+  f<-as.numeric(difftime(all$EndDT[all$Files==id],all$StartDT[all$Files==id],units="secs"))
+  w<- seq(from = 0, to=f, by=1)
+  g<- rep(all$Path[all$Files==id],length(x))
+  h<- rep(all$Files[all$Files==id],length(x))
+  test.d <- data.frame(Path = g,
+                  File = h,
+                  DateTime = x,
+                  RunTime = w,
+                  stringsAsFactors=FALSE)
+  video.df <- rbind(video.df, video.d)
+}
+```
+
+## VLC
+Using the runtimes you created and your csv annotations we are going to create a .bat file that will run VLC and grab a snapshot at the times of your observations
+```{r}
+#### Prepping your data ####
+
+# Read in the csv with your annotations
+annotations<-read.csv("nameofyourcsv.csv", header = TRUE)
+
+# I have a Date and a Time column so I created onother column with both called DateTime
+annotations$DateTime<-paste(annotations$Date,annotations$TC, sep=" ")
+annotations$DateTime<-mdy_hms(annotations$DateTime) # Make sure this is actually in a DateTime format that R understands
+
+# Same thing with video data
+video$DateTime<-paste(video$Date, video$Time, sep=" ")
+video$DateTime<-mdy_hms(video$DateTime)
+
+# Match DateTime in annotations to DateTime in video
+time.match<-subset(annotations, (DateTime %in% video$DateTime))
+# Match DateTime in video to DateTime in annotations
+vtime.match<-subset(video, (DateTime %in% annotations$DateTime))
+all.match<-full_join(time.match, vtime.match, by= "DateTime") # Join matches
+all.match$RunTime<-as.numeric(all.match$RunTime) # Have to make sure that the RunTime is a numeric vector
+
+# Need to create and EndTime vector so that VLC will know when to stop taking screenshots
+all.match$EndTime<-all.match$RunTime + 1
+
+
+
+#### Create a file name structure similar to what SeaTube makes ####
+#Dates
+dates<-unlist(strsplit(as.character(all.match$Date.x), split="/")) # Break apart date
+m<-matrix(dates,ncol=3,byrow=TRUE) # Make matrix
+colnames(m)<-c("Month","Day","Year") # Name columns
+m<-data.frame(m) # Turn matrix to data frame
+ymd<-paste(m$Year,m$Month,m$Day, sep="") # Paste it all together so that it is YYYYMMDD
+
+#Times
+times<-unlist(strsplit(as.character(all.match$TC), split=":")) # Break apart time
+x<-matrix(times,ncol=3,byrow=TRUE) # Make matrix
+colnames(x)<-c("Hours","Minutes","Seconds") # Name columns
+x<-data.frame(x) # Turn matrix to data frame
+hms<-paste(x$Hours,x$Minutes,x$Seconds,sep="") # Paste it all together so that it is HHMMSS
+
+all.match$DTN<-paste(ymd,"T",hms,"_",all.match$ScientificName, sep="") #Paste Date, Time, and ScientificName together for file name
+
+# Make the command
+cmd <- paste('vlc',' ', all.match$FilePath, all.match$VideoName,'.mp4',' ',
+               '--video-filter=scene --start-time=',all.match$RunTime, ' ',
+               '--stop-time=', all.match$EndTime, ' ', '--scene-ratio=24',' ',
+               '--scene-prefix=',all.match$DTN,' ',
+               '--scene-path=C:\\Users\\elizabeth.gugliotti\\Desktop\\ERDAP\\screenshots', ' ',  # Make sure this is the filepath you want
+               'vlc://quit', sep = '')
+
+
+
+#### build a *.bat file ####
+bat<-data.frame(cmd)
+
+cd<- "cd C:\\Program Files\\VideoLAN\\VLC"
+cd<-data.frame(cd)
+
+names(cd)<-names(bat)
+bat<-rbind(cd,bat)
+
+
+write.table(bat, "C:/Users/elizabeth.gugliotti/Desktop/ERDAP/vlc_vidcap.bat",
+            quote = F,
+            row.names = F,
+            col.names = F)
+
+shell.exec("C:/Users/elizabeth.gugliotti/Desktop/ERDAP/vlc_vidcap.bat")
+```
+
