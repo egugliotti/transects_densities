@@ -1,0 +1,388 @@
+```{r Load necessary packages}
+library(dplyr)
+library(lubridate)
+library(tidyverse)
+library(tidyr)
+library(RcppRoll)
+```
+
+
+### Formatting & Filtering your data
+
+Reminder:
+All of these filepaths will have to be changed to where your data is located and what your file is named. There are several different places where this is the case.When you see a filepath, switch it out for the filepath that you are using.
+
+```{r}
+# Read in your .csv file and then store it as a data frame. Making this file into a data frame also makes things faster.
+annotations<- read.csv("C:\\rworking\\CINMS\\data\\ROV_Position.csv", header = TRUE)
+annotations.df<-as.data.frame(annotations)
+
+
+# Dealing with times
+annotations.df<- annotations.df %>%
+  mutate(DateTime = mdy_hms(paste(Date, TC, sep=" ")))
+
+# In my excel file, and as I annotate, I like to annotate when there is usable video (moving in a straigth line which I tell from looking at GIS and the time, and on bottom). In stead of just going by the transects identified on the cruise, I want to include as much usable video as possible, so now I'm going to filter my data frame to get all that juicy good stuff!
+
+annotations.useful<- annotations.df %>%
+  filter(Usable..moving.in.relatively.constant.direction.== "Yes")
+
+# You want to subtract each time from the next to get the time difference between useful data. This will allow notate where there is a huge time difference and this is where you will delineate transects
+
+time.annotation<- annotations.useful %>%
+  mutate(TimeDiff=DateTime - lag(DateTime, default = first(DateTime))) %>%
+  group_by(Dive) %>%
+  mutate(Index= 1:length(TimeDiff))
+```
+
+
+### Assigning transects and transect identifiers
+You are going to use the time.annotation data frame to assign transects and a unique transect identifier
+```{r}
+# Now you want to filter where the time difference is huge so that you can start naming transects. This unfortunately is a convoluted process
+x<-time.annotation %>%
+  filter(TimeDiff >60 | TimeDiff == 0)
+
+# You are going to group by dive and then summarize the number of transects which is the length(Dive), you want the start index which is basically to assign transects by the start and end index. However, pasting them together and then separating them is the best way to do it.
+y<-x %>%
+  group_by(Dive)%>%
+  summarise(NTransect=length(Dive),             
+            Start=paste(Index, collapse= "|", sep=""),
+            End=paste(paste(Index[Index>1]-1, collapse="|"),sep=""),
+            AllT=paste(1:NTransect, collapse = "|"),
+            AllT2=list(1:NTransect))
+
+# Now you need to create a data frame that has the max index for each dive which is the ending index for the final transect. If you write View(y) you will see that in the End column, there is not a value for the ending cell of the final transect. You will then paste this into the data frame above.
+a<-time.annotation %>%
+  group_by(Dive)%>%
+  summarize(MaxIndex=length(Index)) 
+
+y$End<-paste(y$End,a$MaxIndex,sep="|")
+
+
+# Now you are going to omit NAs which occur when there is only one transect during a dive and separate the collapsed values.Then you want to get the total number of cells/time/index that each transect makes up by End-Start, and you also want to create an index for each transect so that it has a unique identifier so to speak.This will make it easier to do data manipulations with each transect rather than trying to do data manipulations with the Dive and the Transect Number which would be like Dive 10, Transect 3 which is harder to sort by in R.
+y<- na.omit(separate_rows(y, Start:AllT,convert=TRUE))
+y$total<-((y$End - y$Start)+1)
+y$t.index<-1:length(y$Dive)
+
+# Now you are going to replicate each of the transect numbers and unique transect identifiers (index) the total number of cells/time/index that they span and put them back into your data frame of annotations.
+time.annotation$Transect<-rep(y$AllT,times=y$total)
+time.annotation$transect_id<-rep(y$t.index, times=y$total)
+```
+
+#### Rolling Window Densities
+You have your annotations with assigned transects and a unique transect identifier. Now its time to calculate rolling window densities during these transects.
+##### Prepping data for density calculations
+```{r}
+# Here i am basically saying to r to select NOT Time, -`Usable (moving in relatively constant direction)`, Date, etc. I am NOT selecting Time and Date because we have the DateTime column. I am also NOT selecting taxa that I know for a fact I did not see so is just all zeros. I put these in my excel spreadsheet because they were taxa that I thought I might see. I also want the transect_id to be numeric rather than any other class of data. Finally, I put in another select command because I need to reorder my columns before the next step. All of your species observations (and debris if you wish) need to be at the end of your data frame. You may have a different number of columns and this select command is going off of the column number in my data frame. If you write View(time.annoation) and hover over the column names, it should pop up and tell you what column number you are hovering over.
+annotation <- time.annotation %>% 
+  select(-TC, -Usable..moving.in.relatively.constant.direction., -Date, -Geodia, -Rhizaxinella, -On.OffTransect, -Segment, -Staurocalyptus, -A.ZoanthidInjury, -E.ZoanthidInjury, -OtherComments) %>%
+  replace(is.na(.), 0) %>%
+  mutate(transect_id=as.numeric(transect_id),
+         Adel_Eugorgia=Adel. + Eugorgia,
+         Octocorals = Adel. + Eugorgia + Lepto. + Acanthogorgia + Muricea + Swiftia + Paragorgia + UnknownOctocoral + Plumarella + Placogorgia)%>%
+  select(1:9, 37:41, 10:36,42:43) # reorder columns for next steps
+
+
+# R doesn't really like wide data so we want to convert our wide data frame that made things easy for data entry, into a long data frame which makes it easier to do further data manipulations to in R. This next step makes multiple rows for each observation by the species. There will be multiple columns with the same data UP UNTIL the species and the count. Run  as.data.frame step. Create a species index (each species = #) so that loops are more efficient. I also need to get just one of the species per rpw next and this will help me do that rather than have every species in a row. after doing this, if you write View(long.annotations), you will notice that the index was assigned alphabetically. I need to arrange this by DateTime so that all the same observations are together.
+long.annotations<- annotation %>% 
+  gather(Species, Count, Adel.:Octocorals) %>%
+  as.data.frame()
+long.annotations<-long.annotations %>%
+  mutate(Species_index = as.numeric(as.factor(long.annotations$Species))) %>%
+  arrange(DateTime)
+```
+
+
+##### Rolling Area Calculations
+```{r}
+# I want the mean area for each transect_id. I am filtering by Species_index because remember how we turned this into a long data frame so there are multiple rows including time, area, lat, long for each species, and we just want one time, area, lat long, etc. observation. It doesn't matter which Species_index number you choose, just as long as its one of them. We are going to get the mean area per second for each transect and then see how many cells it takes to get 100 m^2 if every cell was that mean area. This is what will be our window and each transect will have a different window.
+mean.Area<- long.annotations %>%
+  filter(Species_index == 1) %>%
+  group_by(transect_id) %>%
+  summarise(Dive = unique(Dive),
+            meanArea = mean(XYWarea_Midscreen))%>%
+  mutate(WindowLength = round(100/meanArea, digits = 0))
+
+
+#### Loop to create rolling window areas ####
+# When writing loops, we have to create an empty data frame to put stuff in as the loop goes through itself, so that is what we are doing below.
+df <- data.frame(transect_id=character(),
+                 RollArea = numeric(),
+                 WindowLength = numeric(),
+                 stringsAsFactors=FALSE)
+
+# This loop is saying for a particular value in mean.Area$transect_id i want you to: 
+# 1. create a data frame called x that uses the data frame mean.Area filtered to data where transect_id is equal that particular transect_id pulled out at the start of the loop
+# 2. create a variable y that uses the data frame long.annotations where the transect_id is equal to the same transect_id in the x data frame AND Species_index==1 because we just want every species because thats duplicating all the information that we want (i.e. the area)
+# 3. create a variable a that takes the rolling sum of the the area in data frame y (the area is actually called XYWarea_Midscreen) using the Window length in data frame x and align it in the center.
+# 4. put these in a data frame called d with transect_id, RollArea, and WindowLength
+# 5. merge data frame d with data frame df and also call that df
+
+  for (t in mean.Area$transect_id){
+    x<- mean.Area %>% dplyr::filter(transect_id==t)
+    y<- long.annotations %>% dplyr::filter(Species_index == 1, transect_id==x$transect_id)
+    a<- RcppRoll::roll_sum(y$XYWarea_Midscreen,x$WindowLength, fill=NA, align = "center")
+   
+    d <- data.frame(transect_id = y$transect_id,
+                  RollArea = a,
+                  WindowLength = x$WindowLength,
+                  stringsAsFactors=FALSE)
+  df <- rbind(df, d)
+  }
+
+# Now we want to put those rolling areas that we calculated back into our long.annotations data frame, just to keep everything in the same place for the next step which includes a loop.
+long.annotations$RollArea<-rep(df$RollArea,each=length(unique(long.annotations$Species_index)))
+long.annotations$WindowLength<-rep(df$WindowLength,each=length(unique(long.annotations$Species_index)))
+```
+
+
+##### Rolling Density by Species Calculations
+```{r}
+# This is sourcing a function that I wrote to take the rolling window that I created, get a count of each species, and then create a rolling density. What you need to know is that the function is called by.species() where the first argument will be your mean.Area data frame, the second argument is your long.annotations data frame, and the third argument is whatever species you want. 
+source('rolling-density-species.R')
+
+
+rd.Adel<-by.species(mean.Area,long.annotations,"Adel.")
+rd.Eugorgia<-by.species(mean.Area,long.annotations,"Eugorgia")
+rd.Lepto<-by.species(mean.Area,long.annotations,"Lepto.")
+rd.Lophelia<-by.species(mean.Area,long.annotations,"Lophelia")
+rd.Acanthogorgia<-by.species(mean.Area,long.annotations,"Acanthogorgia")
+rd.Muricea<-by.species(mean.Area,long.annotations,"Muricea")
+rd.Swiftia<-by.species(mean.Area,long.annotations,"Swiftia")
+rd.Antipathes<-by.species(mean.Area,long.annotations,"Antipathes")
+rd.Paragorgia<-by.species(mean.Area,long.annotations,"Paragorgia")
+rd.Plumarella<-by.species(mean.Area,long.annotations,"Plumarella")
+rd.Heterop<-by.species(mean.Area,long.annotations,"Heterop")
+rd.Placogorgia<-by.species(mean.Area,long.annotations,"Placogorgia")
+rd.Stylaster<-by.species(mean.Area,long.annotations,"Stylaster")
+rd.Pennatulacea<-by.species(mean.Area,long.annotations,"Pennatulacea")
+rd.UnknownSponge<-by.species(mean.Area,long.annotations,"UnknownSponge")
+rd.Hexactinellida<-by.species(mean.Area,long.annotations,"Hexactinellida")
+rd.Demospongiae<-by.species(mean.Area,long.annotations,"Demospongiae")
+rd.Farrea<-by.species(mean.Area,long.annotations,"Farrea")
+rd.Adel_Eugorgia<-by.species(mean.Area, long.annotations, "Adel_Eugorgia")
+rd.Octocorals<-by.species(mean.Area, long.annotations, "Octocorals")
+
+rd.all<-do.call("rbind", list(rd.Adel, rd.Eugorgia, rd.Lepto, rd.Lophelia, rd.Acanthogorgia, rd.Muricea, rd.Swiftia, rd.Antipathes, rd.Paragorgia, rd.Plumarella, rd.Heterop, rd.Placogorgia, rd.Stylaster, rd.Pennatulacea, rd.UnknownSponge, rd.Hexactinellida, rd.Demospongiae, rd.Farrea, rd.Adel_Eugorgia, rd.Octocorals))
+
+# You need to turn rd.all into a data frame and take out all of the NA values in the RollDensity column (this happens when a transect starts and stops until the center of the window) so that it can be ingested into GIS and the column will be recognized as numeric rather than categorical
+
+all_species<-rd.all %>%
+  filter (is.na(RollDensity)==FALSE,
+          RollDensity>0)
+  
+  
+
+write.csv(all_species,"C:\\Users\\elizabeth.gugliotti\\Desktop\\California\\CINMS 2019\\RollingDensities.csv", row.names = FALSE)
+
+write.csv(all_species,"C:\\rworking\\CINMS\\data\\RollingDensities.csv", row.names = FALSE)
+
+```
+
+
+##### Detecting Coral Gardens
+# Trying to figure out a ways to find the corals gardens was difficult and this is the only ways I could think to do it. It tells me where a coral garden (>=50 single species & >=100 for multiple species) colonies per meters square. It doesn't however tell me the exact distance/area it stretches from start to finish since each point in the center of the rolling densities. This requries a time conusuming and rather difficult data manipulation process that I haven't had time to get to.
+
+Each transect has a different length window so you need to find the starting point of the window for the beginning of the coral garden and the end point of the window for the end of the coral garden. You can't do this by time because the length of the window is how many cells it calculates density for, not the time, so you have to get the exact cell that window starts at.
+
+REGARDLESS, this just allows you to get an idea of where those gardens are.
+```{r}
+#### Adelogorgia garden ####
+# Filter for adelogorgia, create a lag so that you can make distinct gardens that are greater than 30 seconds apart (you can change that 30 seconds apart if you want it maybe > 60 seconds or something else), replace values in that grdn.TimeDiff that are greater than 90 with 0, create new groupings whenever a 0 appears and number that grouping. 
+
+grdn.Adel<- rd.all %>%
+    filter(Species=="Adel.",
+           RollDensity>=50) %>%
+    mutate(grdn.TimeDiff = DateTime - lag(DateTime, default = first(DateTime))) %>%
+    mutate(grdn.TimeDiff = replace(grdn.TimeDiff, grdn.TimeDiff > 90, 0)) %>%
+    group_by(Dive, garden_id = cumsum(grdn.TimeDiff ==0)) %>%
+    select(1:3, DateTime, RollDensity, garden_id, everything())
+
+# Get a summary of what you found but mostly you want to get the start and end index and then you need to see how long the window is so you can subtract half the window length from the start index and add half the window length to the end index which will give you the entire length of the coral garden.
+summary_grdn.Adel<- grdn.Adel %>%
+   group_by(Dive, garden_id) %>%
+   summarise(StartTime = min(DateTime),
+             StartLat = Lat[which(DateTime == min(DateTime))],
+             StartLong = Long[which(DateTime == min(DateTime))],
+             StartWindow = WindowLength[which(DateTime == min(DateTime))],
+             StartIndex = round(Index[which(DateTime == min(DateTime))] - (StartWindow/2), digits = 0),
+             EndTime = max(DateTime),
+             EndLat = Lat[which(DateTime == max(DateTime))],
+             EndLong = Long[which(DateTime == max(DateTime))],
+             EndWindow = WindowLength[which(DateTime == max(DateTime))],
+             EndIndex = round(Index[which(DateTime == max(DateTime))] + (EndWindow /2), digits = 0),
+             IndexLength = EndIndex-StartIndex,
+             Duration = EndTime-StartTime,
+             Max_Density = max(RollDensity),
+             Max_Density_Time = DateTime[which(RollDensity == max(RollDensity))])
+View(summary_grdn.Adel)
+
+# Now you are going to use a loop to create a sequence of numbers from the start to the end index for each of the coral gardens and put them into a data frame called df
+df <- data.frame(Index = numeric(),
+                 garden = numeric(),
+                 Dive = numeric(),
+                 stringsAsFactors=FALSE)
+for (i in 1:length(summary_grdn.Adel$Dive)){
+  x<-seq(summary_grdn.Adel$StartIndex[i], summary_grdn.Adel$EndIndex[i])
+  y<-rep(summary_grdn.Adel$Dive[i], times =length(x))
+  z<-rep(summary_grdn.Adel$garden_id[i], times = length(x))
+  d <- data.frame(Index = x,
+                  garden = z,
+                  Dive = y,
+                  stringsAsFactors=FALSE)
+  df <- rbind(df, d)
+}
+
+# Now you need to take that rd.all data frame and filter it so that you just have the species you need, in this case it is Adelogorgia
+all.Adel<-rd.all %>%
+  filter(Species=="Adel.")
+
+# We are going to merge that data frame of the index number, dive, and garden with the all.Adel data frame which will just keep the values where there is a match thankfully.
+grdn.Adel_window<- merge(all.Adel, df, by = c("Dive","Index"))
+
+# Finally, we can create a summary data frame that gives us the start information, end information, total count, total area, and we can calculate the actual density of the whole extent of the coral gardens.
+grdn.Adel_all<- grdn.Adel_window %>%
+  group_by(Dive, garden) %>%
+  summarise(StartTime = min(DateTime),
+            StartLatitude = Lat[which(DateTime==StartTime)],
+            StartLongitude = Long[which(DateTime==StartTime)],
+            StopTime = max(DateTime),
+            StopLatitude = Lat[which(DateTime==StopTime)],
+            StopLongitude = Long[which(DateTime==StopTime)],
+            Count_grdn = sum(Count),
+            area = sum(XYWarea_Midscreen),
+            Density_per100sqm = (Count_grdn/area)*100)
+View(grdn.Adel_all)
+
+
+#### Eugorgia garden ####
+grdn.Eugorgia<- rd.all %>%
+    filter(Species=="Eugorgia",
+           RollDensity>=50) %>%
+    mutate(grdn.TimeDiff = DateTime - lag(DateTime, default = first(DateTime))) %>%
+    mutate(grdn.TimeDiff = replace(grdn.TimeDiff, grdn.TimeDiff > 30, 0)) %>%
+    group_by(Dive, garden_id = cumsum(grdn.TimeDiff ==0)) %>%
+    select(1:3, DateTime, RollDensity, garden_id, everything())
+
+# Get a summary of what you found but mostly you want to get the start and end index and then you need to see how long the window is so you can subtract half the window length from the start index and add half the window length to the end index which will give you the entire length of the coral garden.
+summary_grdn.Eugorgia<- grdn.Eugorgia %>%
+   group_by(Dive, garden_id) %>%
+   summarise(StartTime = min(DateTime),
+             StartLat = Lat[which(DateTime == min(DateTime))],
+             StartLong = Long[which(DateTime == min(DateTime))],
+             StartWindow = WindowLength[which(DateTime == min(DateTime))],
+             StartIndex = round(Index[which(DateTime == min(DateTime))] - (StartWindow/2), digits = 0),
+             EndTime = max(DateTime),
+             EndLat = Lat[which(DateTime == max(DateTime))],
+             EndLong = Long[which(DateTime == max(DateTime))],
+             EndWindow = WindowLength[which(DateTime == max(DateTime))],
+             EndIndex = round(Index[which(DateTime == max(DateTime))] + (EndWindow /2), digits = 0),
+             IndexLength = EndIndex-StartIndex,
+             Duration = EndTime-StartTime,
+             Max_Density = max(RollDensity),
+             Max_Density_Time = DateTime[which(RollDensity == max(RollDensity))])
+View(summary_grdn.Eugorgia)
+
+# Now you are going to use a loop to create a sequence of numbers from the start to the end index for each of the coral gardens and put them into a data frame called df
+df <- data.frame(Index = numeric(),
+                 garden = numeric(),
+                 Dive = numeric(),
+                 stringsAsFactors=FALSE)
+for (i in 1:length(summary_grdn.Eugorgia$Dive)){
+  x<-seq(summary_grdn.Eugorgia$StartIndex[i], summary_grdn.Eugorgia$EndIndex[i])
+  y<-rep(summary_grdn.Eugorgia$Dive[i], times =length(x))
+  z<-rep(summary_grdn.Eugorgia$garden_id[i], times = length(x))
+  d <- data.frame(Index = x,
+                  garden = z,
+                  Dive = y,
+                  stringsAsFactors=FALSE)
+  df <- rbind(df, d)
+}
+
+# Now you need to take that rd.all data frame and filter it so that you just have the species you need, in this case it is Eugorgia
+all.Eugorgia<-rd.all %>%
+  filter(Species=="Eugorgia")
+
+# We are going to merge that data frame of the index number, dive, and garden with the all.Adel data frame which will just keep the values where there is a match thankfully.
+grdn.Eugorgia_window<- merge(all.Eugorgia, df, by = c("Dive","Index"))
+
+# Finally, we can create a summary data frame that gives us the start information, end information, total count, total area, and we can calculate the actual density of the whole extent of the coral gardens.
+grdn.Eugorgia_all<- grdn.Eugorgia_window %>%
+  group_by(Dive, garden) %>%
+  summarise(StartTime = min(DateTime),
+            StartLatitude = Lat[which(DateTime==StartTime)],
+            StartLongitude = Long[which(DateTime==StartTime)],
+            StopTime = max(DateTime),
+            StopLatitude = Lat[which(DateTime==StopTime)],
+            StopLongitude = Long[which(DateTime==StopTime)],
+            Count_grdn = sum(Count),
+            area = sum(XYWarea_Midscreen),
+            Density_per100sqm = (Count_grdn/area)*100)
+View(grdn.Eugorgia_all)
+
+
+#### All octocorals garden ####
+grdn.Octocorals<- rd.all %>%
+    filter(Species=="Octocorals",
+           RollDensity>=100) %>%
+    mutate(grdn.TimeDiff = DateTime - lag(DateTime, default = first(DateTime))) %>%
+    mutate(grdn.TimeDiff = replace(grdn.TimeDiff, grdn.TimeDiff > 90, 0)) %>%
+    group_by(Dive, garden_id = cumsum(grdn.TimeDiff ==0)) %>%
+    select(1:3, DateTime, RollDensity, garden_id, everything())
+
+# Get a summary of what you found but mostly you want to get the start and end index and then you need to see how long the window is so you can subtract half the window length from the start index and add half the window length to the end index which will give you the entire length of the coral garden.
+summary_grdn.Octocorals<- grdn.Octocorals %>%
+   group_by(Dive, garden_id) %>%
+   summarise(StartTime = min(DateTime),
+             StartLat = Lat[which(DateTime == min(DateTime))],
+             StartLong = Long[which(DateTime == min(DateTime))],
+             StartWindow = WindowLength[which(DateTime == min(DateTime))],
+             StartIndex = round(Index[which(DateTime == min(DateTime))] - (StartWindow/2), digits = 0),
+             EndTime = max(DateTime),
+             EndLat = Lat[which(DateTime == max(DateTime))],
+             EndLong = Long[which(DateTime == max(DateTime))],
+             EndWindow = WindowLength[which(DateTime == max(DateTime))],
+             EndIndex = round(Index[which(DateTime == max(DateTime))] + (EndWindow /2), digits = 0),
+             IndexLength = EndIndex-StartIndex,
+             Duration = EndTime-StartTime,
+             Max_Density = max(RollDensity),
+             Max_Density_Time = DateTime[which(RollDensity == max(RollDensity))])
+View(summary_grdn.Octocorals)
+
+# Now you are going to use a loop to create a sequence of numbers from the start to the end index for each of the coral gardens and put them into a data frame called df
+df <- data.frame(Index = numeric(),
+                 garden = numeric(),
+                 Dive = numeric(),
+                 stringsAsFactors=FALSE)
+for (i in 1:length(summary_grdn.Octocorals$Dive)){
+  x<-seq(summary_grdn.Octocorals$StartIndex[i], summary_grdn.Octocorals$EndIndex[i])
+  y<-rep(summary_grdn.Octocorals$Dive[i], times =length(x))
+  z<-rep(summary_grdn.Octocorals$garden_id[i], times = length(x))
+  d <- data.frame(Index = x,
+                  garden = z,
+                  Dive = y,
+                  stringsAsFactors=FALSE)
+  df <- rbind(df, d)
+}
+
+# Now you need to take that rd.all data frame and filter it so that you just have the species you need, in this case it is Octocorals
+all.Octocorals<-rd.all %>%
+  filter(Species=="Octocorals")
+
+# We are going to merge that data frame of the index number, dive, and garden with the all.Adel data frame which will just keep the values where there is a match thankfully.
+grdn.Octocorals_window<- merge(all.Octocorals, df, by = c("Dive","Index"))
+
+# Finally, we can create a summary data frame that gives us the start information, end information, total count, total area, and we can calculate the actual density of the whole extent of the coral gardens.
+grdn.Octocorals_all<- grdn.Octocorals_window %>%
+  group_by(Dive, garden) %>%
+  summarise(StartTime = min(DateTime),
+            StartLatitude = Lat[which(DateTime==StartTime)],
+            StartLongitude = Long[which(DateTime==StartTime)],
+            StopTime = max(DateTime),
+            StopLatitude = Lat[which(DateTime==StopTime)],
+            StopLongitude = Long[which(DateTime==StopTime)],
+            Count_grdn = sum(Count),
+            area = sum(XYWarea_Midscreen),
+            Density_per100sqm = (Count_grdn/area)*100)
+View(grdn.Octocorals_all)
