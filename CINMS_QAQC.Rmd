@@ -1,0 +1,425 @@
+Load your packages. There are a lot.
+```{r load packages}
+library(stringr)
+library(lubridate)
+library(dplyr)
+library(rgdal)
+library(sp)
+library(sf)
+library(maptools)
+library(rerddap)
+library(leaflet)
+library(leaflet.esri)
+library(RColorBrewer)
+library(ggplot2)
+library(rmarkdown)
+library(raster)
+library(knitr)
+library(tidyr)
+library(data.table)
+library(formattable)
+library(tidyverse)
+```
+
+
+## Data formatting
+These are the normal formatting steps needed normally that we have gone through before albiet somewhat in a different order.
+```{r}
+annotations<- read.csv("C:\\rworking\\CINMS\\data\\ROV_Position.csv", header = TRUE)
+annotations$Lat<-format(as.numeric(annotations$Lat), digits=7)
+annotations$Long<-format(as.numeric(annotations$Long), digits=8)
+
+#### Dealing with times, filtering, selecting, replace NA ####
+annotations<- annotations %>%
+  mutate(DateTime = mdy_hms(paste(Date, TC, sep=" "))) %>%
+  filter(Usable..moving.in.relatively.constant.direction.== "Yes") %>%
+  dplyr::select(-Geodia, -Staurocalyptus, -OtherComments) %>%
+  replace_na(list(Adel. = 0, Eugorgia = 0, Lepto. = 0, Lophelia = 0, Acanthogorgia = 0, Muricea = 0, Swiftia = 0, Antipathes = 0, Paragorgia = 0, Plumarella = 0, Heterop = 0, Placogorgia = 0, Stylaster = 0, Flabellum = 0, UnknownOctocoral = 0, Desmophyllum = 0, Funiculina_Halipteris = 0, Acanthoptilum = 0, Pennatula = 0, Pennatulacea = 0, Ptilosarcus = 0, UnknownSponge = 0, Hexactinellida = 0, Demospongiae = 0, Farrea = 0, Rhizaxinella = 0, A.ZoanthidInjury = 0, E.ZoanthidInjury = 0, Debris = 0, XYWarea_Midscreen = 0)) %>%
+  mutate(Habitat = case_when(Geology == "RR" ~ "Hard",
+                                 Geology == "RB" ~ "Hard",
+                                 Geology == "RC" ~ "Hard",
+                                 Geology == "RP" ~ "Hard",
+                                 Geology == "BR" ~ "Hard",
+                                 Geology == "BB" ~ "Hard",
+                                 Geology == "BC" ~ "Hard",
+                                 Geology == "CR" ~ "Hard",
+                                 Geology == "CB" ~ "Hard",
+                                 Geology == "CC" ~ "Hard",
+                                 Geology == "RU" ~ "Mixed",
+                                 Geology == "BU" ~ "Mixed",
+                                 Geology == "CU" ~ "Mixed",
+                                 Geology == "PU" ~ "Mixed",
+                                 Geology == "UR" ~ "Mixed",
+                                 Geology == "UP" ~ "Mixed",
+                                 Geology == "UB" ~ "Mixed",
+                                 Geology == "UC" ~ "Mixed",
+                                 Geology == "UU" ~ "Soft"))
+
+#### Assigning Transects ####
+# These transects are going to be restricted to a single substrate, preferably 100m^2. However there will be many transects that are smaller. We are keeping only transects that are >=30m^3 because this covers 85% of the observations but isn't to small to not make sense.
+# For this part, like with the rolling densities, we need to calculate the time difference row by row. This makes it so we can group it by dive, and look for jumps of greater than 30 seconds so that we can parse out transects later. When there is a time jump of > 30 seconds, we want it to be replaced with a 0, because that will be time 0 for a new transect.
+substrate_annotations<- annotations %>%
+  group_by(Dive, Habitat) %>%
+  mutate(TimeDiff=DateTime - lag(DateTime, default = first(DateTime))) %>%
+  mutate(TimeDiff = replace(TimeDiff, TimeDiff > 30, 0))
+
+
+# Now we need to filter only for when the area per second is greater than 0 otherwise we get an error for some reason. We group by dive, habitat, and grp (transect), get a cumulative sum for the area per second that MARE gives us, and then we use the modulus operator to basically start over every time the cumulative area gets close to 100m^2 without going over. We need to make a lag for that modulus so that we can create transect segments when transects go over 100m^2, select() is going to allow us to order the columns in the way we want it, and then filter for when transect/segments are >=30m^2.
+seg.sub30<-substrate_annotations %>%
+  filter(XYWarea_Midscreen>0) %>%
+  group_by(Dive, Habitat, grp = cumsum(TimeDiff==0)) %>%
+  mutate(cumsum = cumsum(XYWarea_Midscreen)) %>%
+  mutate(modulus = cumsum %% 100) %>%
+  filter(max(modulus)>=30) %>%
+  mutate(SumDiff= modulus - lag(modulus, default = first(modulus)))%>%
+  mutate(SumDiff = replace(SumDiff, SumDiff < 0, 0)) %>%
+  group_by(Dive, Habitat, grp, seg = cumsum(SumDiff==0)) %>%
+  dplyr::select(1:3, DateTime, Habitat, grp, seg, modulus, everything()) %>%
+  filter(max(modulus)>=30) %>%
+  mutate(SampleID = as.character(paste(Dive, grp, seg, sep="_")),
+         Long = as.numeric(Long),
+         Lat = as.numeric(Lat)) %>%
+  as.data.frame()
+
+
+#### Create the DSCRTP submission format to go through other part of QA/QC process ####
+indata<- seg.sub30 %>% 
+  dplyr::select(-A.ZoanthidInjury, -E.ZoanthidInjury) %>%
+  gather(ScientificName, IndividualCount, Adel.:Farrea) %>%
+  as.data.frame()
+indata<- indata %>%
+  mutate(VernacularNameCategory = case_when(ScientificName =="Adel." ~ "gorgonian coral",
+                             ScientificName =="Eugorgia"~"gorgonian coral", 
+                             ScientificName =="Lepto." ~ "gorgonian coral",
+                             ScientificName =="Acanthogorgia"~"gorgonian coral", 
+                             ScientificName =="Muricea"~"gorgonian coral", 
+                             ScientificName =="Swiftia"~"gorgonian coral", 
+                             ScientificName =="Placogorgia"~"gorgonian coral", 
+                             ScientificName =="Paragorgia"~"gorgonian coral", 
+                             ScientificName =="Plumarella"~"gorgonian coral", 
+                             ScientificName =="Heterop"~"soft coral", 
+                             ScientificName =="Funiculina_Halipteris"~"sea pen", 
+                             ScientificName =="Acanthoptilum"~"sea pen", 
+                             ScientificName =="Pennatula"~"sea pen",
+                             ScientificName =="Ptilosarcus"~"sea pen",
+                             ScientificName =="Antipathes"~"black coral",
+                             ScientificName =="Stylaster"~"lace coral",
+                             ScientificName =="Lophelia"~"stony coral (branching)",
+                             ScientificName =="Flabellum"~"stony coral (cup coral)",
+                             ScientificName =="Desmophyllum"~"stony coral (cup coral)",
+                             ScientificName =="Rhizaxinella"~"demosponge",
+                             ScientificName =="Farrea"~"glass sponge",
+                             ScientificName =="UnknownSponge"~"sponge (unspecified)",
+                             ScientificName =="Hexactinellida"~"glass sponge",
+                             ScientificName =="Demospongiae"~"demosponge",
+                             ScientificName =="Pennatulacea"~"sea pen",
+                             ScientificName =="UnknownOctocoral"~"gorgonian coral")) %>%
+    mutate(Locality = case_when(Dive ==1 ~"Anacapa Passage",
+                                Dive ==2 ~"Anacapa Passage", 
+                                Dive ==3 ~"Santa Cruz Island",
+                                Dive ==4 ~"Santa Cruz Canyon", 
+                                Dive ==5 ~"Santa Cruz Canyon", 
+                                Dive ==6 ~"Southeast Santa Cruz Island", 
+                                Dive ==7 ~"Southeast Santa Cruz Island", 
+                                Dive ==8 ~"Southeast Santa Cruz Island", 
+                                Dive ==9 ~"Santa Cruz Canyon", 
+                                Dive ==10 ~"West Santa Rosa Island", 
+                                Dive ==11 ~"North San Miguel Island", 
+                                Dive ==12 ~"North San Miguel Island", 
+                                Dive ==13 ~"North San Miguel Island",
+                                Dive ==14 ~"North San Miguel Island",
+                                Dive ==15 ~"North San Miguel Island",
+                                Dive ==16 ~"West San Miguel Island",
+                                Dive ==17 ~"West San Miguel Island",
+                                Dive ==18 ~"Southwest Santa Rosa Island",
+                                Dive ==19 ~"Southwest Santa Cruz Island",
+                                Dive ==20 ~"Northwest Anacapa Island",
+                                Dive ==21~"Northwest Anacapa Island",
+                                Dive ==22~"South Anacapa Island",
+                                Dive ==23~"South Anacapa Island",
+                                Dive ==24~"Santa Cruz Canyon",
+                                Dive ==25~"Northwest Anacapa Island",
+                                Dive ==26~"North Anacapa Island",
+                                Dive ==27~"Northwest Anacapa Island",
+                                Dive ==28~"Northwest Anacapa Island",
+                                Dive ==29~"Northwest Anacapa Island",
+                                Dive ==30~"Northwest Anacapa Island")) %>%
+  mutate(ScientificName = replace(ScientificName,ScientificName =="Adel.", "Adelogorgia phyllosclera"),
+         ScientificName = replace(ScientificName,ScientificName =="Eugorgia","Eugorgia rubens"), 
+         ScientificName = replace(ScientificName,ScientificName =="Acanthogorgia", "Acanthogorgia sp."),
+         ScientificName = replace(ScientificName,ScientificName =="Lepto.", "Leptogorgia chilensis"),
+         ScientificName = replace(ScientificName,ScientificName =="Muricea","Muricea fruticosa"), 
+         ScientificName = replace(ScientificName,ScientificName =="Swiftia", "Swiftia pacifica"), 
+         ScientificName = replace(ScientificName,ScientificName =="Paragorgia","Paragorgia arborea"), 
+         ScientificName = replace(ScientificName,ScientificName =="Plumarella","Plumarella longispina"),
+         ScientificName = replace(ScientificName,ScientificName =="Placogorgia","Placogorgia sp."),
+         ScientificName = replace(ScientificName,ScientificName =="Heterop","Heteropolypus ritteri"), 
+         ScientificName = replace(ScientificName,ScientificName =="Funiculina_Halipteris","Pennatulacea"), 
+         ScientificName = replace(ScientificName,ScientificName =="Acanthoptilum","Acanthoptilum gracile"),
+         ScientificName = replace(ScientificName,ScientificName =="Pennatula", "Pennatula phosphorea"),
+         ScientificName = replace(ScientificName,ScientificName =="Ptilosarcus","Ptilosarcus gurneyi"),
+         ScientificName = replace(ScientificName,ScientificName =="UnknownOctocoral","Octocorallia"),
+         ScientificName = replace(ScientificName,ScientificName =="UnknownSponge","Porifera"),
+         ScientificName = replace(ScientificName,ScientificName =="Antipathes","Antipathes dendrochristos"),
+         ScientificName = replace(ScientificName,ScientificName =="Stylaster","Stylaster californicus"),
+         ScientificName = replace(ScientificName,ScientificName =="Lophelia","Lophelia pertusa"),
+         ScientificName = replace(ScientificName,ScientificName =="Desmophyllum","Desmophyllum dianthus"),
+         ScientificName = replace(ScientificName,ScientificName =="Flabellum","Scleractinia"),
+         ScientificName = replace(ScientificName,ScientificName =="Rhizaxinella","Rhizaxinella sp."),
+         ScientificName = replace(ScientificName,ScientificName =="Farrea","Farrea sp.")) %>%
+  filter(IndividualCount > 0) %>%
+  rename(EventID = Dive)
+  
+```
+
+## Maping out points
+#### Converting points to line function
+This function creates the points_to_line function like in GIS. The actual function will be used in the next chunk. To be honest, I'm not quite sure what this all does, I straight up copied it from the interweb.
+```{r}
+points_to_line <- function(data, long, lat, id_field = NULL, sort_field = NULL) {
+  
+  # Convert to SpatialPointsDataFrame
+  coordinates(data) <- c(long, lat)
+  
+  # If there is a sort field...
+  if (!is.null(sort_field)) {
+    if (!is.null(id_field)) {
+      data <- data[order(data[[id_field]], data[[sort_field]]), ]
+    } else {
+      data <- data[order(data[[sort_field]]), ]
+    }
+  }
+  
+  # If there is only one path...
+  if (is.null(id_field)) {
+    
+    lines <- SpatialLines(list(Lines(list(Line(data)), "id")))
+    
+    return(lines)
+    
+    # Now, if we have multiple lines...
+  } else if (!is.null(id_field)) {  
+    
+    # Split into a list by ID field
+    paths <- sp::split(data, data[[id_field]])
+    
+    sp_lines <- SpatialLines(list(Lines(list(Line(paths[[1]])), "line1")))
+    
+    # I like for loops, what can I say...
+    for (p in 2:length(paths)) {
+      id <- paste0("line", as.character(p))
+      l <- SpatialLines(list(Lines(list(Line(paths[[p]])), id)))
+      sp_lines <- spRbind(sp_lines, l)
+    }
+    
+    return(sp_lines)
+  }
+}
+```
+
+Using the function to create points to line and then mapping using leaflet. This is just a maps of the dive lines using the seg.sub30 data frame, not the indata data frame because we want the continuous nav, not the annotations of taxa.
+```{r}
+# Points to line function. The fields are pretty self explanatory. The id_field is how you want to separate each line, the sort_field is how you want to construct the line, and we want it to be constructed using time.
+nav_lines <- points_to_line (data = seg.sub30,
+                             long = "Long",
+                             lat = "Lat",
+                             id_field = "Dive",
+                             sort_field = "TC")
+# Create leaflet map
+leaflet(data=nav_lines) %>%
+  addTiles()%>%
+  addPolylines()
+```
+
+This section is to make sure that the observations fall on the lines. This has basically already been done if you created the maps using GIS of the dives and annotations. Besides, we are using the nav data to make annotations anyways so this is kind of not needed but hey, why not just double check.
+```{r}
+# Now we want to create a SpatialLinesDataFrame out of our newsly created dive lines and matches the information about those lines to them. Each line in nav_lines is called "line#" from "line1" to the last line that has transects during it. We need to create a data frame with the information about each dive because we could use that information to format the leaflet map that we will eventually make. But to join that data frame with the nav_lines, we need the row names to be the same "line#".
+nav_unique<-seg.sub30 %>%
+  distinct(Dive,.keep_all=TRUE)
+nav_names<-c(1:length(nav_unique$Dive))
+nav_names<-paste("line",nav_names, sep="")
+rownames(nav_unique)<-nav_names
+SLDF = SpatialLinesDataFrame(nav_lines,nav_unique)
+
+
+# Need to get length of dives with transects and then create a color palette with enough unique colors for those dives. Googling "color names R studio" should pull up enough results to help you to get the color names to be able to do this.
+length(unique(as.factor(indata$VernacularNameCategory)))
+pal2<-colorFactor(palette = c("black","cadetblue1","purple","red","mediumvioletred","blue", "darkgreen","indianred1","white","seagreen1"), domain=as.factor(indata$VernacularNameCategory))
+
+# Now we are going to create the leaflet map where the dive lines are plack, the circles are colored by the VernacularNameCategory, each circle has a popup that tells you about it, and then there is a legend that shows what color each VernacularNameCateogry is assigned. I tried to match these to the ones on the DSCRTP map as best as possible.
+leaflet(data=SLDF) %>%
+  addTiles()%>%
+  addPolylines(color = "black") %>%
+  addCircleMarkers(data=indata,
+                   lat=indata$Lat,
+                   lng=indata$Long,
+                   color=~pal2(as.factor(indata$VernacularNameCategory)),
+                   stroke = FALSE,
+                   fillOpacity = 0.5,
+                   popup=paste("Dive:",indata$EventID,"<br>",
+                               "ScientificName:",indata$ScientificName,"<br>",
+                               "SampleID:",indata$SampleID,"<br>",
+                               "Latitude:",indata$Lat,"<br>",
+                               "Longitude:",indata$Long, "<br>",
+                               "Depth:", indata$Depth, "<br>",
+                               "DateTime:", indata$DateTime)) %>%
+  addLegend("bottomright",pal=pal2, values=as.factor(indata$VernacularNameCategory),
+            title="Vernacular Name Category",
+            opacity=1)
+```
+
+
+This next section uses the GEBCO 2019 raster to check the depths. If you have better resolution bathymetry rasters by all means use that. The function raster() can read many different types of files. The GEBCO 2019 one is a .nc file but you can use a geoTIFF file, .grd, .img, etc.
+```{r}
+#### GEBCO 2019 Raster ####
+# I want to find the boundaries of the data i'm going to have to download from gebco
+max(indata$Lat)
+min(indata$Lat)
+max(indata$Long)
+min(indata$Long)
+
+# To get this you just need to google download.gebco.net and it should bring you to where you can enter in the boundaries that you just got above and download the grid 2D netCDF
+gebco<-raster("C:\\rworking\\CINMS\\data\\gebco_2019_n34.3_s33.7_w-120.6_e-119.3.nc")
+
+# Some geospatial stuff that has to happen.
+in.gebco<-indata
+coordinates(in.gebco) <- c("Long","Lat")
+proj4string(in.gebco) <- "+proj=longlat +ellps=WGS84 +datum=WGS84"
+
+# extract GEBCO data to points
+in.gebco$GEBCO <- raster::extract(gebco, in.gebco)
+in.gebco$GEBCO <- in.gebco$GEBCO  * -1
+
+# Calculate depth difference and depth percent difference between annotations and GEBCO 2019 raster
+indata$GEBCO<-in.gebco$GEBCO
+indata$GEBCODepthPCent<-(abs(indata$Depth-indata$GEBCO)/indata$GEBCO)*100
+indata$GEBCODiff<-(abs(indata$Depth-indata$GEBCO))
+
+model2<-lm(Depth~GEBCO, data=indata)
+sum2<-summary(model2)
+# sum2$coefficients[2,3] gets you the t-value if you want to compare different bathymetry raster layers
+
+# Get all points where there is >15% difference between the depth you have recorded and the depth GEBCO 2019 has.You are going to notice there are quite a lot of points that there is a greater than 15% difference. THIS DOES NOT MEAN YOUR DEPTH IS WRONG. There are less depth matches when there are rapid topographic changes over short distances, which in a place like California explains a lot of what we see around CINMS. When I did this for Okeanos dives, I got better matches because there were less steeply sloping areas. You can type View(problems.GEBCO) to see all of them.
+problems.GEBCO<-indata %>%
+  dplyr::filter(indata$GEBCODepthPCent>15)
+
+# This just gives us a plot comparing the depths from annotations to the depths from GEBCO 2019.
+m <- ggplot(indata, aes(Depth, GEBCO))
+m <- m + geom_point(size = .7) +
+  geom_smooth(method=lm, se=TRUE)+
+  labs(y="Depth from GEBCO 2019 (m)",x="Depth from Annotations (m)")+
+  geom_text(x=300, y=3300, hjust=0, label= paste("T-value =", format(round(sum2$coefficients[2,3],2), nsmall=2)))+
+  geom_text(x=300, y=3200, hjust=0, label= paste("N > 15% Depth Difference =", nrow(problems.GEBCO)))+
+  theme(panel.background=element_rect(fill="white"), axis.line = element_line(size = 1, colour = "black"))
+m
+```
+
+Here is a leaflet plot that shows all of the annotations with >15% difference with the GEBCO 2019 depth.
+```{r}
+leaflet(options=leafletOptions(maxZoom=25)) %>% 
+  addEsriBasemapLayer(esriBasemapLayers$Oceans) %>% 
+  addCircleMarkers(data=problems.GEBCO,
+                   lat=problems.GEBCO$Lat,
+                   lng=problems.GEBCO$Long,
+                   color="red",
+                   popup=paste("Dive:",problems.GEBCO$EventID,"<br>",
+                               "ScientificName:",problems.GEBCO$ScientificName,"<br>",
+                               "SampleID:",problems.GEBCO$SampleID,"<br>",
+                               "DateTime:", problems.GEBCO$DateTime,"<br>",
+                               "Depth:",problems.GEBCO$Depth,"<br>",
+                               "GEBCO Depth:",problems.GEBCO$GEBCO,"<br>",
+                               "Depth Difference:", problems.GEBCO$GEBCODiff,"<br>",
+                               "Latitude:",problems.GEBCO$Lat,"<br>",
+                               "Longitude:",problems.GEBCO$Long))
+```
+
+
+## Species depth check
+```{r PublishedList, echo = FALSE}
+# Bring in SEDCI published species list that I created for the west coast from Hourigan et al. 2017
+dir.proj <- file.path('C:', 'rworking', 'CINMS', 'scripts')
+source(file.path(dir.proj, 'WestCoast.R'))
+
+# In indata, filter just corals because the published species list just has corals
+corals<- indata %>%
+  dplyr::filter(!VernacularNameCategory %in% c("demosponge","glass sponge","sponge (unspecified)"))
+
+# Make sure there aren't any corals in your data that don't have a match in the masterTaxon list from the published species lit
+test<-setdiff(corals$ScientificName, masterTaxon$ScientificName)
+test
+```
+
+#### Depth Flag
+```{r DepthCheck, echo=FALSE}
+# Create an index because loops do better with an index
+corals$index <- seq(1:length(corals$ScientificName))
+
+# Create empty data frame
+df <- data.frame(ScientificName = character(),
+                 index = numeric(),
+                 ShallowTest = character(),
+                 DeepTest = character(),
+                 Depth = numeric(),
+                 MinDepth = numeric(),
+                 MaxDepth = numeric(),
+                 stringsAsFactors=FALSE)
+
+# Loop to search through corals, match it to the same scientific name in the masterTaxon list and check if the depth exceeds the minimum or maximum depth in the masterTaxon list.
+for (id in corals$index){
+  x <- corals %>% filter(index == id)
+  y <- masterTaxon %>% filter(ScientificName == x$ScientificName)
+  z <- x$Depth > y$MinDepth # if this is true and
+  r <- x$Depth < y$MaxDepth # this is true, then all is good
+  f <- y$MinDepth
+  g <- y$MaxDepth
+  d <- data.frame(ScientificName=x$ScientificName,
+                  index = x$index,
+                  ShallowTest = z,
+                  DeepTest = r,
+                  Depth = x$Depth,
+                  MinDepth = f,
+                  MaxDepth = g,
+                  DateTime = x$DateTime,
+                  stringsAsFactors=FALSE)
+  df <- rbind(df, d)
+}
+# Sort through the dataframe to pull out records where either the ShallowTest is False, or the DeepTest is False and then select the columns that will help us identify which records those are.
+df<- df %>%
+  dplyr::filter(ShallowTest==FALSE | DeepTest==FALSE) %>%
+  dplyr::select(ScientificName, ShallowTest, DeepTest, Depth, MinDepth, MaxDepth,DateTime)
+# Print df in a nice table
+formattable(df)
+```
+
+#### Double check some of the flagged records with the National Database
+This part looks at the deep-sea coral national database at the species that has been flagged as too shallow to see if it is out of range even for those observations.
+```{r}
+# Get info about the national database including variable names
+info<-info(datasetid = 'deep_sea_corals', url = "https://www.ncei.noaa.gov/erddap/")
+View(info)
+
+# Create a table called d from the national database where longitude meets conditions, latitude meets conditions, and genus is Pennatula since that is the questionable taxa we got according to the published depths and we want to get the fields listed below.
+d <- tabledap("deep_sea_corals", 'longitude<-117', 'longitude>-126','latitude>31', 'latitude<39','Genus="Pennatula"',
+              fields=c('ScientificName', 
+                       'Species','Class','Subclass','Order',
+                       'Suborder','Family','Subfamily','Phylum', 'TaxonRank', 'DepthInMeters'),
+                        url = "https://www.ncei.noaa.gov/erddap/")
+
+# To do this you want to group by the ScientificName and then summarize by these conditions. DepthInMeters is actually a character class so we need to convert it to a numeric class so watch out for that.
+sum_tbl <-
+  d %>%
+  group_by(ScientificName) %>%
+  summarize(
+    Phylum = unique(Phylum),
+    Class = unique(Class),
+    Subclass = unique(Subclass),
+    Order = unique(Order),
+    Suborder = unique(Suborder),
+    Family = unique(Family),
+    Species = paste(unique(Species), collapse= " | "),
+    MinDepth = min(as.numeric(DepthInMeters)),
+    MaxDepth = max(as.numeric(DepthInMeters)),
+    TaxonRank = paste(unique(TaxonRank), collapse= " | ")) %>%
+  View()
+# What I got from this is my depths are probably okay. 
+```
