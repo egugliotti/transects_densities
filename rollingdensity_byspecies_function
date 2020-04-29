@@ -1,0 +1,38 @@
+# dat1 = mean.Area
+# dat2 = long.annotations
+
+
+# Create a function called by.species that requires the 3 inputs, that (for the purpose of the function and the loop) we are calling dat1, dat2, and species
+by.species<- function(dat1,dat2,species){
+  
+# from dat2 (long.annotations), filter to where the Species equals the species that you put in the function  
+  dat2<-dat2 %>%
+    filter(Species==species)
+  
+# create an empty data frame for the loop...because we have to
+  df <- data.frame(transect_id = character(),
+                   Species = character (),
+                   RollDensity = numeric(),
+                   stringsAsFactors=FALSE)
+# for value in dat1$transect_id (which will be mean.Area$transect_id):
+  # 1. Create data frame x from dat1 (mean.Area) where the transect_id is equal to the transect_id pulled out above
+  # 2. Create data frame y from dat2 (long.annotations) where the transect_id is equal to the transect_id in x
+  # 3. Create variable a that is a rolling sum of the count from long.annotations using the WindowLength in x, then divide it by the RollArea and multiply it by 100
+  # 4. Put these in data frame d
+  # 5. merge data frame d with df and call it df also
+  for (t in dat1$transect_id){
+    x<- dat1 %>% dplyr::filter(transect_id==t)
+    y<- dat2 %>% dplyr::filter(transect_id==x$transect_id)
+    a<- (RcppRoll::roll_sum(y$Count,x$WindowLength, fill=NA, align = "center")/y$RollArea)*100
+    
+    d <- data.frame(transect_id = y$transect_id,
+                    Species = y$Species,
+                    RollDensity= a,
+                    stringsAsFactors=FALSE)
+    df <- rbind(df, d)
+  }
+  
+  # Now you are going to make a column in dat2(long.annotations) called RollDensity from df$RollDensity
+  dat2$RollDensity<-df$RollDensity
+  print(dat2)
+}
