@@ -1,0 +1,210 @@
+```{r load necessary packages}
+library(dplyr)
+library(lubridate)
+library(tidyverse)
+```
+
+#### Formatting & Filtering your data
+```{r}
+#### Read in your .csv file ####
+# Yours will probably be named nav_transects.csv rather than ROV_Position.csv so just switch that out.
+annotations<- read.csv("C:\\rworking\\CINMS\\data\\ROV_Position.csv", header = TRUE)
+
+# This is just making sure that we have more than 4 digits in our lat and long
+annotations$Lat<-format(as.numeric(annotations$Lat), digits=12)
+annotations$Long<-format(as.numeric(annotations$Long), digits=13)
+
+#### Dealing with times, filtering, selecting, and replace NA ####
+# Like before, we need to make that date and time into a format we can work with, then we are filtering by usable video, selecting to not have columns we dont want or know that we don't have any annotations in, and then replacing NA with zeros. This time you need to include the XYWarea_midscreen in that too.
+annotations<- annotations %>%
+  mutate(DateTime = mdy_hms(paste(Date, TC, sep=" "))) %>%
+  filter(Usable..moving.in.relatively.constant.direction.== "Yes") %>%
+  select(-Geodia, -Staurocalyptus, -OtherComments) %>%
+  replace_na(list(Adel. = 0, Eugorgia = 0, Lepto. = 0, Lophelia = 0, Acanthogorgia = 0, Muricea = 0, Swiftia = 0, Antipathes = 0, Paragorgia = 0, Plumarella = 0, Heterop = 0, Placogorgia = 0, Stylaster = 0, Flabellum = 0, UnknownOctocoral = 0, Desmophyllum = 0, Funiculina_Halipteris = 0, Acanthoptilum = 0, Pennatula = 0, Pennatulacea = 0, Ptilosarcus = 0, UnknownSponge = 0, Hexactinellida = 0, Demospongiae = 0, Farrea = 0, Rhizaxinella = 0, A.ZoanthidInjury = 0, E.ZoanthidInjury = 0, Debris = 0, XYWarea_Midscreen = 0))
+```
+
+
+### Actually making the transects
+```{r}
+# So for this part, we need to calculate the time difference row by row. This makes it so we can group it by dive, and look for jumps of greater than 30 seconds so that we can parse out transects later. When there is a time jump of > 30 seconds, we want it to be replaced with a 0, because that will be time 0 for a new transect.
+time.annotation<- annotations %>%
+  mutate(TimeDiff=DateTime - lag(DateTime, default = first(DateTime)))%>%
+  group_by(Dive) %>%
+  mutate(TimeDiff = replace(TimeDiff, TimeDiff > 30, 0))
+
+# Okay so there is a lot going on here so I am going to coach you through it before you try to execute it.
+  # We are taking that data frame that we just made, and we need to select only the rows where the are is greater than zero, or else this will make things hard to parse out later
+  # Now, we want to group by dive, and also group by a new varible we are making called grp which is making a new grp (transect) out of the cumulative times the TimeDiff is 0. I'm still a bit fuzzy on why this works, but I found it on the plethora of online help available for R and we are just going to go with it.
+  # Now, still maintaining these groups by dive and grp (transect), we want to calculate the cumulative area of each grp (transect)
+  # Get ready for some math that you probably don't ever remember learning, I know I didn't, but in terms of data, is super useful. A modulus expression works on integers and yields the remainder when the first operand is divided by the second. In R, the modulus operator is %%. Basically, we have cumulative areas which are much greater than 100 m^2, what we want is to just get the remainder when the area is divided by 100. This allows us to basically start over at 0 every time we go another 100 m^2 and get transect segments that are basically 100 m^2. ISN"T THAT NEAT!!!! I was confused, shook, and impressed when I learned about modulus operators, ironically trying to teach myself Python. 
+  # Now, we need to basically mark when each new transect segment begins and we are going to do that similarly to what we did with TimeDiff. We are going to subtract the previous row from each row. Whenever a new transect segment starts, this value will be a negative number.
+  # Now we want to replace whatever that negative number is, with a 0 so we can use that, again, the same way we did TimeDiff to group things.
+  # And again we are doing that grouping by the cumulative sum when SumDiff==0. You need to make sure that under group_by you have Dive and grp (transect) along with seg or else it doesn't quite work. Also again, why this works still doesn't make sense to me but I just know that it does and it does what we need it to.
+  # Now, I just wanted to reorder my columns so that I can go through and make sure that it works
+  # Finally, you want to get rid of any transect segments that are less than say 90 m^2
+seg.100m<-time.annotation %>%
+  filter(XYWarea_Midscreen>0) %>%
+  group_by(Dive, tsect = cumsum(TimeDiff==0))%>%
+  mutate(cumsum = cumsum(XYWarea_Midscreen))%>%
+  mutate(modulus = cumsum %% 100) %>%
+  mutate(SumDiff= modulus - lag(modulus, default = first(modulus)))%>%
+  mutate(SumDiff = replace(SumDiff, SumDiff < 0, 0)) %>%
+  group_by(Dive, tsect, seg = cumsum(SumDiff==0)) %>%
+  select(1:3, DateTime, tsect, seg, modulus, everything()) %>%
+  filter(max(modulus)>90)
+
+# We need to see if there are any we need to replace the grp number because some entire groups were less than 90 m^2. I wish there was a way eliminate these before assigning grp but I could not figure it out ¯\_(ツ)_/¯.
+# I would take note of what grps are missing and what they need to be replaced with. Say dive 1 has grp 1,2,3,5. You need to replace 5 with 4. We will do this next.
+seg.100m %>%
+   group_by(Dive, tsect) %>%
+   distinct(tsect, .keep_all = TRUE) %>%
+   select(Dive,tsect) %>%
+   View()
+
+# For me, these are the dive grps that I needed to replace. You have to do this using base R synthax because dplyr won't reassign values for things it is using to group_by. This is saying for dataframe$($ means column)grp[when dataframe$Dive is equal to a # AND dataframe$grp is equal to a #]<-make it this # instead
+seg.100m$tsect[seg.100m$Dive==4 & seg.100m$tsect==7]<-5
+seg.100m$tsect[seg.100m$Dive==12 & seg.100m$tsect==7]<-6
+seg.100m$tsect[seg.100m$Dive==15 & seg.100m$tsect==7]<-6
+seg.100m$tsect[seg.100m$Dive==16 & seg.100m$tsect==6]<-5
+seg.100m$tsect[seg.100m$Dive==16 & seg.100m$tsect==7]<-6
+seg.100m$tsect[seg.100m$Dive==19 & seg.100m$tsect==4]<-3
+seg.100m$tsect[seg.100m$Dive==19 & seg.100m$tsect==7]<-4
+
+# we need to see if there are any we need to replace the tsect number because some entire groups were less than 
+seg.100m %>%
+   group_by(Dive, tsect) %>%
+   distinct(tsect, .keep_all = TRUE) %>%
+   select(Dive,tsect) %>%
+   View()
+```
+
+
+
+### Getting counts & densities for these transects
+#### Counts
+This is going to take that data frame that we made just prior and group it by the Dive, grp (transect), and seg (segment).
+
+Then we are going to use summarise to basically create a new data frame from summary values of the seg.100 m data frame based on the groupings. Our summary table will have:
+1. Dive Number  
+2. Transect (grp) Number  
+3. Transect Segment (seg) Number  
+4. Start time of transect segment
+5. Start Latitude
+6. Start Longitude
+7. End time of transect Segment
+8. End Latitude
+9. End Longitude
+10. Area of transect segment
+11. Counts of each species in that transect segment
+```{r}
+sum_100m<- seg.100m %>%
+  group_by(Dive, tsect, seg) %>%
+  summarise(StartTime = min(DateTime),
+            StartLatitude = Lat[which(DateTime == min(DateTime))],
+            StartLongitude = Long[which(DateTime == min(DateTime))],
+            EndTime = max(DateTime),
+            EndLatitude = Lat[which(DateTime == max(DateTime))],
+            EndLongitude = Long[which(DateTime == max(DateTime))],
+            Final_area=max(modulus),
+            Adelogorgia = sum(Adel.),
+            Eugorgia = sum(Eugorgia),
+            Leptogorgia = sum(Lepto.),
+            Acanthogorgia = sum(Acanthogorgia),
+            Muricea = sum(Muricea),
+            Swiftia = sum(Swiftia),
+            Placogorgia = sum(Placogorgia),
+            Paragorgia = sum(Paragorgia),
+            Plumarella = sum(Plumarella),
+            Heteropolypus = sum(Heterop),
+            UnknownOctocoral = sum(UnknownOctocoral),
+            Funiclina_Halipteris = sum(Funiculina_Halipteris),
+            Acanthoptilum = sum(Acanthoptilum),
+            Pennatula = sum(Pennatula),
+            Ptilosarcus = sum(Ptilosarcus),
+            Pennatulacea = sum(Pennatulacea),
+            Antipathes = sum(Antipathes),
+            Stylaster = sum(Stylaster),
+            Lophelia = sum(Lophelia),
+            Flabellum = sum(Flabellum),
+            Desmophyllum = sum(Desmophyllum),
+            UnknownSponge = sum(UnknownSponge),
+            Demospongiae = sum(Demospongiae),
+            Rhizaxinella = sum(Rhizaxinella),
+            Hexactinellida = sum(Hexactinellida),
+            Farrea = sum(Farrea))
+```
+
+
+#### Densities
+This is going to do the same thing as we did for counts but just create densities using that area we calculated for each transect segment.
+```{r}
+density_100m<- seg.100m %>%
+  group_by(Dive, tsect, seg) %>%
+  summarise(StartTime = min(DateTime),
+            StartLat = Lat[which(DateTime == min(DateTime))],
+            StartLong = Long[which(DateTime == min(DateTime))],
+            EndTime = max(DateTime),
+            EndLatitude = Lat[which(DateTime == max(DateTime))],
+            EndLongitude = Long[which(DateTime == max(DateTime))],
+            Final_area=max(modulus),
+            Adelogorgia = (sum(Adel.)/Final_area)*100,
+            Eugorgia = (sum(Eugorgia)/Final_area)*100,
+            Leptogorgia = (sum(Lepto.)/Final_area)*100,
+            Acanthogorgia = (sum(Acanthogorgia)/Final_area)*100,
+            Muricea = (sum(Muricea)/Final_area)*100,
+            Swiftia = (sum(Swiftia)/Final_area)*100,
+            Placogorgia = (sum(Placogorgia)/Final_area)*100,
+            Paragorgia = (sum(Paragorgia)/Final_area)*100,
+            Plumarella = (sum(Plumarella)/Final_area)*100,
+            Heteropolypus = (sum(Heterop)/Final_area)*100,
+            UnknownOctocoral = (sum(UnknownOctocoral)/Final_area)*100,
+            Funiclina_Halipteris = (sum(Funiculina_Halipteris)/Final_area)*100,
+            Acanthoptilum = (sum(Acanthoptilum)/Final_area)*100,
+            Pennatula = (sum(Pennatula)/Final_area)*100,
+            Ptilosarcus = (sum(Ptilosarcus)/Final_area)*100,
+            Pennatulacea = (sum(Pennatulacea)/Final_area)*100,
+            Antipathes = (sum(Antipathes)/Final_area)*100,
+            Stylaster = (sum(Stylaster)/Final_area)*100,
+            Lophelia = (sum(Lophelia)/Final_area)*100,
+            Flabellum = (sum(Flabellum)/Final_area)*100,
+            Desmophyllum = (sum(Desmophyllum)/Final_area)*100,
+            UnknownSponge = (sum(UnknownSponge)/Final_area)*100,
+            Demospongiae = (sum(Demospongiae)/Final_area)*100,
+            Rhizaxinella = (sum(Rhizaxinella)/Final_area)*100,
+            Hexactinellida = (sum(Hexactinellida)/Final_area)*100,
+            Farrea = (sum(Farrea)/Final_area)*100)
+```
+
+
+
+```{r}
+counts<- sum_100m %>% 
+  gather(Species, Counts, Adelogorgia:Farrea) %>%
+  filter(Counts > 0) %>%
+  as.data.frame()
+
+density<- density_100m %>% 
+  gather(Species, Density, Adelogorgia:Farrea) %>%
+  as.data.frame()%>%
+  filter(Density> 0) %>%
+  select(StartTime,Species,Density)
+
+
+#### Put them together ####
+counts_density<- merge(counts, density, by = c("StartTime", "Species"))
+counts_density<- counts_density %>%
+  mutate(Species = replace(Species,Species =="Adelogorgia", "Adelogorgia phyllosclera"),
+         Species = replace(Species,Species =="Eugorgia","Eugorgia rubens"), 
+         Species = replace(Species,Species =="Leptogorgia", "Leptogorgia chilensis"),
+         Species = replace(Species,Species =="Muricea","Muricea fruticosa"), 
+         Species = replace(Species,Species =="Swiftia", "Swiftia pacifica"), 
+         Species = replace(Species,Species =="Paragorgia","Paragorgia arborea"), 
+         Species = replace(Species,Species =="Plumarella","Plumarella longispina"), 
+         Species = replace(Species,Species =="Heteropolypus","Heteropolypus ritteri"), 
+         Species = replace(Species,Species =="Funiculina_Halipteris","Pennatulacea"), 
+         Species = replace(Species,Species =="Ptilosarcus","Ptilosarcus gurneyi"),
+         Species = replace(Species,Species =="Antipathes","Antipathes dendrochristos"),
+         Species = replace(Species,Species =="Stylaster","Stylaster californicus"),
+         Species = replace(Species,Species =="Lophelia","Lophelia pertusa"),
+         Species = replace(Species,Species =="UnknownSponge", "Porifera"))
+```
