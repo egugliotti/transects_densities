@@ -1,0 +1,509 @@
+## Metadata Required
+You can use this if you wish to fill in the meta data using r
+```{r}
+metadata<-matrix(c("Metadata","",
+                   "DataProvider","NOAA National Centers for Coastal Ocean Science",
+                   "DataContact", "Etnoyer, Peter; peter.etnoyer@noaa.gov",
+                   "Citation", "Etnoyer, P.J., Shuler, A., Gugliotti, E.F., Duncan,                       E., Caldow, C. 2020. Cruise Report for 'Deep-Sea Coral Gardens'                       Expedition 2019: R/V Shearwater SW-19-06. NOAA Technical                              Memorandum NOS NCCOS xxx. 82 pp.",
+                   "Repository", "Marine Applied Research and Exploration",
+                   "Modified", "2020-04-09",
+                   "Reporter", "Etnoyer, Peter",
+                   
+                   "Survey Data","",
+                   "SurveyID", "SW-19-06",
+                   "Vessel", "R/V Shearwater",
+                   "VehicleName", "ROV Beagle",
+                   "PI", "Etnoyer, Peter",
+                   "PIAffiliation", "NOAA National Centers for Coastal Ocean Science",
+                   "SamplingEquipment","ROV",
+                   "DepthMethod", "reported",
+                   "NavType", "USBL",
+                   "LocationAccuracy", "10m",
+                   "Purpose", "deep-sea coral survey",
+                   "SurveyComments", "The research objective was to estimate densities of corals and spongeswithin the 50-50 m depth range We report video transect areas 30-10 sq m, representing 85% of on-bottom occurrences, Temperature shows the mean value for a segment. The OccurrenceComments field shows coral health as perent of colonies with injury, primarily zoanthid overgrowth. See the cruise report for detailed methods.",
+                   
+                   "Observation Data","",
+                   "RecordType", "video transect",
+                   "IdentifiedBy", "Gugliotti, Elizabeth",
+                   "IdentificationQualifier","ID by expert from video",
+                   "IdentificationDate", "2020-01-15",
+                   "IdentificationComments", NA), ncol=2, byrow = TRUE)
+colnames(metadata)<-c("FieldName","Data Provider Add Entries Below")
+View(metadata)
+
+write.csv(metadata,"C:\\rworking\\CINMS\\data\\metadata.csv", row.names = FALSE)
+```
+
+```{r loading packages}
+library(dplyr)
+library(lubridate)
+library(tidyverse)
+library(ggplot2)
+```
+
+#### Formatting & Filtering your data
+```{r}
+#### Read in your .csv file ####
+annotations<- read.csv("C:\\rworking\\CINMS\\data\\ROV_Position.csv", header = TRUE)
+
+# This is just making sure that we have more than 4 digits in our lat and long
+annotations$Lat<-format(as.numeric(annotations$Lat), digits=7)
+annotations$Long<-format(as.numeric(annotations$Long), digits=8)
+
+#### Dealing with times, filtering, selecting, and replace NA ####
+# Like before, we need to make that date and time into a format we can work with, then we are filtering by usable video, selecting to not have columns we dont want or know that we don't have any annotations in, and then replacing NA with zeros. This time you need to include the XYWarea_midscreen in that too. After that, you are going to recode the different geology annotations for the coarser categories of hard, mixed, and soft.
+annotations<- annotations %>%
+  mutate(DateTime = mdy_hms(paste(Date, TC, sep=" "))) %>%
+  filter(Usable..moving.in.relatively.constant.direction.== "Yes") %>%
+  select(-Geodia, -Staurocalyptus, -OtherComments) %>%
+  replace_na(list(Adel. = 0, Eugorgia = 0, Lepto. = 0, Lophelia = 0, Acanthogorgia = 0, Muricea = 0, Swiftia = 0, Antipathes = 0, Paragorgia = 0, Plumarella = 0, Heterop = 0, Placogorgia = 0, Stylaster = 0, Flabellum = 0, UnknownOctocoral = 0, Desmophyllum = 0, Funiculina_Halipteris = 0, Acanthoptilum = 0, Pennatula = 0, Pennatulacea = 0, Ptilosarcus = 0, UnknownSponge = 0, Hexactinellida = 0, Demospongiae = 0, Farrea = 0, Rhizaxinella = 0, A.ZoanthidInjury = 0, E.ZoanthidInjury = 0, Debris = 0, XYWarea_Midscreen = 0)) %>%
+  mutate(Habitat = case_when(Geology == "RR" ~ "Hard",
+                                 Geology == "RB" ~ "Hard",
+                                 Geology == "RC" ~ "Hard",
+                                 Geology == "RP" ~ "Hard",
+                                 Geology == "BR" ~ "Hard",
+                                 Geology == "BB" ~ "Hard",
+                                 Geology == "BC" ~ "Hard",
+                                 Geology == "CR" ~ "Hard",
+                                 Geology == "CB" ~ "Hard",
+                                 Geology == "CC" ~ "Hard",
+                                 Geology == "RU" ~ "Mixed",
+                                 Geology == "BU" ~ "Mixed",
+                                 Geology == "CU" ~ "Mixed",
+                                 Geology == "PU" ~ "Mixed",
+                                 Geology == "UR" ~ "Mixed",
+                                 Geology == "UP" ~ "Mixed",
+                                 Geology == "UB" ~ "Mixed",
+                                 Geology == "UC" ~ "Mixed",
+                                 Geology == "UU" ~ "Soft"))
+```
+
+
+## Assigning transects
+These transects are going to be restricted to a single substrate, preferably 100m^2. However there will be many transects that are smaller. We are keeping only transects that are >=30m^3 because this covers 85% of the observations but isn't to small to not make sense. To see how this is determinined, go below to the heading: Determining the minimum transect length that you should use
+```{r}
+# So for this part, like with the rolling densities, we need to calculate the time difference row by row. This makes it so we can group it by dive, and look for jumps of greater than 30 seconds so that we can parse out transects later. When there is a time jump of > 30 seconds, we want it to be replaced with a 0, because that will be time 0 for a new transect.
+substrate_annotations<- annotations %>%
+  group_by(Dive, Habitat) %>%
+  mutate(TimeDiff=DateTime - lag(DateTime, default = first(DateTime))) %>%
+  mutate(TimeDiff = replace(TimeDiff, TimeDiff > 30, 0))
+
+
+# Now we need to filter only for when the area per second is greater than 0 otherwise we get an error for some reason. We group by dive, habitat, and grp (transect), get a cumulative sum for the area per second that MARE gives us, and then we use the modulus operator to basically start over every time the cumulative area gets close to 100m^2 without going over. We need to make a lag for that modulus so that we can create transect segments when transects go over 100m^2, select() is going to allow us to order the columns in the way we want it, and then filter for when transect/segments are >=30m^2.
+seg.sub30<-substrate_annotations %>%
+  filter(XYWarea_Midscreen>0) %>%
+  group_by(Dive, Habitat, grp = cumsum(TimeDiff==0)) %>%
+  mutate(cumsum = cumsum(XYWarea_Midscreen)) %>%
+  mutate(modulus = cumsum %% 100) %>%
+  filter(max(modulus)>=30) %>%
+  mutate(SumDiff= modulus - lag(modulus, default = first(modulus)))%>%
+  mutate(SumDiff = replace(SumDiff, SumDiff < 0, 0)) %>%
+  group_by(Dive, Habitat, grp, seg = cumsum(SumDiff==0)) %>%
+  select(1:3, DateTime, Habitat, grp, seg, modulus, everything()) %>%
+  filter(max(modulus)>=30)
+```
+
+
+## Counts and Densities
+```{r}
+#### Counts ####
+# We are going to get counts for each transect segment for every taxa observed along with the date, start time, and other information that we will need for the DSCRTP submission For start values you will be getting values that belong to the start DateTime which is the minimum DateTime for each transect segment, end values are the maximum time for each transect segment. At the end of this we are going to assign transect numbers to each of the segments for each dive (i.e. Dive 1, Transect 1, ...., Dive 2, Transect 1,....)
+sum_substrate<- seg.sub30  %>%
+  group_by(Dive, Habitat, grp, seg) %>%
+  summarise(Date = Date[which(DateTime == min(DateTime))],
+            StartTime= TC[which(DateTime == min(DateTime))],
+            StartDateTime = min(DateTime),
+            StartLatitude = Lat[which(DateTime == min(DateTime))],
+            StartLongitude = Long[which(DateTime == min(DateTime))],
+            EndTime = TC[which(DateTime == max(DateTime))],
+            EndDateTime = max(DateTime),
+            EndLatitude = Lat[which(DateTime == max(DateTime))],
+            EndLongitude = Long[which(DateTime == max(DateTime))],
+            MinimumDepthInMeters = min(Depth),
+            MaximumDepthInMeters = max(Depth),
+            Temperature = mean(seg.sub30$Temp),
+            Final_area=max(modulus),
+            Adelogorgia = sum (Adel.),
+            Eugorgia = sum(Eugorgia),
+            Leptogorgia = sum(Lepto.),
+            Acanthogorgia = sum(Acanthogorgia),
+            Muricea = sum(Muricea),
+            Swiftia = sum(Swiftia),
+            Placogorgia = sum(Placogorgia),
+            Paragorgia = sum(Paragorgia),
+            Plumarella = sum(Plumarella),
+            Heteropolypus = sum(Heterop),
+            Octocorallia = sum(UnknownOctocoral),
+            Funiculina_Halipteris = sum(Funiculina_Halipteris),
+            Acanthoptilum = sum(Acanthoptilum),
+            Pennatula = sum(Pennatula),
+            Ptilosarcus = sum(Ptilosarcus),
+            Pennatulacea = sum(Pennatulacea),
+            Antipathes = sum(Antipathes),
+            Stylaster = sum(Stylaster),
+            Lophelia = sum(Lophelia),
+            Flabellum = sum(Flabellum),
+            Desmophyllum = sum(Desmophyllum),
+            Porifera = sum(UnknownSponge),
+            Demospongiae = sum(Demospongiae),
+            Rhizaxinella = sum(Rhizaxinella),
+            Hexactinellida = sum(Hexactinellida),
+            Farrea = sum(Farrea),
+            Debris = sum(Debris)) %>%
+  arrange(StartDateTime) %>%
+  as.data.frame() %>%
+  group_by(Dive) %>%
+  mutate(Transect = 1:length(seg)) %>%
+  select(Dive, Transect, Habitat, 5:44)
+
+# Now we want to make this into a long data frame where all those different columns for each taxa, we are going to create a column called species where the values are those different column names and a column called IndividualCount where the values are the counts that were filled in each cell. Also, we are keeping all the transect info (Date, StartLongitude, etc.) whereas when we do the same thing for densities, we aren't because we are later going to merge the data frames together and we don't want dublicate information.
+counts<- sum_substrate %>% 
+  gather(Species, IndividualCount, Adelogorgia:Farrea) %>%
+  as.data.frame()
+
+
+#### Densities ####
+# This is the same thing as we did for the counts except you are going to see the addition of A_Injury and E_Injury. These are the percent of injured colonies for Adelogorgia and Eugorgia. The A_Injury is calculated using the count injured/count adelogorgia *100. The E_Injured is different because the name for the count and for density are both Eugorgia so I needed to figure out a different way which was the count injured/(density Eugorgia * area) *100. Another step that is different is turning the NA values for A_Injury and E_Injury to 0's which is important otherwise we will get NaNs (Not a Number) later which are hard to replace.
+density_sub<- seg.sub30 %>%
+  group_by(Dive, Habitat, grp, seg) %>%
+  summarise(StartDateTime = min(DateTime),
+            StartLatatitude = Lat[which(DateTime == min(DateTime))],
+            StartLongitude = Long[which(DateTime == min(DateTime))],
+            EndDateTime = max(DateTime),
+            EndLatatitude = Lat[which(DateTime == max(DateTime))],
+            EndLongitude = Long[which(DateTime == max(DateTime))],
+            MinimumDepthInMeters = min(Depth),
+            MaximumDepthInMeters = max(Depth),
+            Final_area=max(modulus),
+            Adelogorgia = (sum(Adel.)/Final_area),
+            Eugorgia = (sum(Eugorgia)/Final_area),
+            Leptogorgia = (sum(Lepto.)/Final_area),
+            Acanthogorgia = (sum(Acanthogorgia)/Final_area),
+            Muricea = (sum(Muricea)/Final_area),
+            Swiftia = (sum(Swiftia)/Final_area),
+            Placogorgia = (sum(Placogorgia)/Final_area),
+            Paragorgia = (sum(Paragorgia)/Final_area),
+            Plumarella = (sum(Plumarella)/Final_area),
+            Heteropolypus = (sum(Heterop)/Final_area),
+            Octocorallia = (sum(UnknownOctocoral)/Final_area),
+            Funiculina_Halipteris = (sum(Funiculina_Halipteris)/Final_area),
+            Acanthoptilum = (sum(Acanthoptilum)/Final_area),
+            Pennatula = (sum(Pennatula)/Final_area),
+            Ptilosarcus = (sum(Ptilosarcus)/Final_area),
+            Pennatulacea = (sum(Pennatulacea)/Final_area),
+            Antipathes = (sum(Antipathes)/Final_area),
+            Stylaster = (sum(Stylaster)/Final_area),
+            Lophelia = (sum(Lophelia)/Final_area),
+            Flabellum = (sum(Flabellum)/Final_area),
+            Desmophyllum = (sum(Desmophyllum)/Final_area),
+            Porifera = (sum(UnknownSponge)/Final_area),
+            Demospongiae = (sum(Demospongiae)/Final_area),
+            Rhizaxinella = (sum(Rhizaxinella)/Final_area),
+            Hexactinellida = (sum(Hexactinellida)/Final_area),
+            Farrea = (sum(Farrea)/Final_area),
+            A_Injury = (sum(A.ZoanthidInjury)/sum(Adel.))*100,
+            E_Injury =(sum(E.ZoanthidInjury)/(Eugorgia*Final_area))*100,
+            Debris = (sum(Debris)/Final_area)) %>%
+  arrange(StartDateTime) %>%
+  as.data.frame() %>%
+  group_by(Dive) %>%
+  mutate(A_Injury = ifelse(is.na(A_Injury), 0, A_Injury),
+         E_Injury = ifelse(is.na(E_Injury), 0, E_Injury)) %>%
+  mutate(Transect = 1:length(seg)) %>%
+  select(Dive, Transect, Habitat, 5:41)
+
+# Also, similar to the counts, we are making it a long data frame an then selecting the StartDateTime, Species, and Density not all the values because they are already present in the Counts data frame.
+density<- density_sub %>% 
+  gather(Species, Density, Adelogorgia:Farrea) %>%
+  as.data.frame() %>%
+  select(StartDateTime, Species, Density)
+
+
+
+#### Getting percent injured of Adelogorgia & Eugorgia ####
+# This is a bit of a convoluted method because of the NaNs I mentioned before so we need to get the Adelogorgia injury from the short data frame and create a column called "Adelogorgia" so that it can be joined to the density data frame later using species name.
+A.injury<-density_sub %>%
+  mutate(Species="Adelogorgia") %>%
+  select(StartDateTime, Dive, A_Injury, Species)
+
+# Same thing for the Eugorgia injury
+E.injury<-density_sub %>%
+  mutate(Species="Eugorgia") %>%
+  select(StartDateTime, Dive,E_Injury, Species)
+
+# Now we are going to join the A.injury data frame to the density data frame by StartDateTime and Species. This will fill in NA's where there aren't matches which is whenever the Species isn't Adelogorgia
+density1<-left_join(density, A.injury, by = c("StartDateTime","Species"))
+# We also need to make sure that we have 0's instead of NA's because of what happens later. We also want to get rid of the dive column
+density1<- density1 %>%
+  mutate(A_Injury = ifelse(is.na(A_Injury), 0, A_Injury))%>%
+  select(-Dive)
+
+
+# We are going to do the same thing for Eugorgia except we are going to not include the density column because we already have it in the density1 data frame and we don't need it again.
+density2<-left_join(density, E.injury, by = c("StartDateTime","Species"))
+density2<- density2 %>%
+  mutate(E_Injury = ifelse(is.na(E_Injury), 0, E_Injury)) %>%
+  select(-Dive,-Density)
+
+# We are going to join the Adelogorgia (density1) and Eugorgia (density2) injury data frames by StartDateTime and Species
+density3<-left_join(density1,density2, by = c("StartDateTime","Species"))
+
+# Last we want to add the A_Injury column and E_Injury column together to get injury, this is why we turned NAs into 0s, otherwise we would have gotten NaNs. We are able to add these because for A_Injury there will be #'s for injury when the species name is Adelogorgia and 0s when the species is anything else, same for Eugorgia. Also, we want to get rid of the A_Injury column and E_Injury column because now we havea new column with the same info called Injury.
+density<-density3 %>%
+  mutate(Injury = A_Injury+E_Injury) %>%
+  select(-A_Injury,-E_Injury)
+```
+
+
+## Putting the submission together
+```{r}
+#### Put them together ####
+# We are going to merge the densities and counts by StartDateTime and Species
+submission<- merge(counts, density, by = c("StartDateTime","Species"))
+
+
+# The steps that happen next are:
+# 1. Create VernacularNameCategory and whenever Species == "speciesname", assign "thisvernacularname"
+# 2. Create Locality based on Dive #s
+# 3. Replace species names with acutaly species names since currently most only have the genus because they used to be column names and r doesn't like for column names to have spaces
+# 4. Filter where the IndividualCount>0 because we aren't reporting absence
+# 5. Change names of certain columns to match DSCRTP format
+# 6. Select only columns that the DSCRTP submission needs
+# 7. Arrange according to dive (EventID), transect number (SampleID), and species (ScientificName)
+# 8. Mutate the OccurrenceComments field so that when there is a number greater than 0, that number is pasted with "percent injured" but when it isn't, make it NA
+submission<- submission %>%
+  mutate(VernacularNameCategory = case_when(Species =="Adelogorgia" ~ "gorgonian coral",
+                             Species =="Eugorgia"~"gorgonian coral", 
+                             Species =="Leptogorgia" ~ "gorgonian coral",
+                             Species =="Acanthogorgia"~"gorgonian coral", 
+                             Species =="Muricea"~"gorgonian coral", 
+                             Species =="Swiftia"~"gorgonian coral", 
+                             Species =="Placogorgia"~"gorgonian coral", 
+                             Species =="Paragorgia"~"gorgonian coral", 
+                             Species =="Plumarella"~"gorgonian coral", 
+                             Species =="Heteropolypus"~"soft coral", 
+                             Species =="Funiculina_Halipteris"~"sea pen", 
+                             Species =="Acanthoptilum"~"sea pen", 
+                             Species =="Pennatula"~"sea pen",
+                             Species =="Ptilosarcus"~"sea pen",
+                             Species =="Antipathes"~"black coral",
+                             Species =="Stylaster"~"lace coral",
+                             Species =="Lophelia"~"stony coral (branching)",
+                             Species =="Flabellum"~"stony coral (cup coral)",
+                             Species =="Desmophyllum"~"stony coral (cup coral)",
+                             Species =="Rhizaxinella"~"demosponge",
+                             Species =="Farrea"~"glass sponge",
+                             Species =="Porifera"~"sponge (unspecified)",
+                             Species =="Hexactinellida"~"glass sponge",
+                             Species =="Demospongiae"~"demosponge",
+                             Species =="Pennatulacea"~"sea pen",
+                             Species =="Octocorallia"~"gorgonian coral")) %>%
+    mutate(Locality = case_when(Dive ==1 ~"Anacapa Passage",
+                                Dive ==2 ~"Anacapa Passage", 
+                                Dive ==3 ~"Santa Cruz Island",
+                                Dive ==4 ~"Santa Cruz Canyon", 
+                                Dive ==5 ~"Santa Cruz Canyon", 
+                                Dive ==6 ~"Southeast Santa Cruz Island", 
+                                Dive ==7 ~"Southeast Santa Cruz Island", 
+                                Dive ==8 ~"Southeast Santa Cruz Island", 
+                                Dive ==9 ~"Santa Cruz Canyon", 
+                                Dive ==10 ~"West Santa Rosa Island", 
+                                Dive ==11 ~"North San Miguel Island", 
+                                Dive ==12 ~"North San Miguel Island", 
+                                Dive ==13 ~"North San Miguel Island",
+                                Dive ==14 ~"North San Miguel Island",
+                                Dive ==15 ~"North San Miguel Island",
+                                Dive ==16 ~"West San Miguel Island",
+                                Dive ==17 ~"West San Miguel Island",
+                                Dive ==18 ~"Southwest Santa Rosa Island",
+                                Dive ==19 ~"Southwest Santa Cruz Island",
+                                Dive ==20 ~"Northwest Anacapa Island",
+                                Dive ==21~"Northwest Anacapa Island",
+                                Dive ==22~"South Anacapa Island",
+                                Dive ==23~"South Anacapa Island",
+                                Dive ==24~"Santa Cruz Canyon",
+                                Dive ==25~"Northwest Anacapa Island",
+                                Dive ==26~"North Anacapa Island",
+                                Dive ==27~"Northwest Anacapa Island",
+                                Dive ==28~"Northwest Anacapa Island",
+                                Dive ==29~"Northwest Anacapa Island",
+                                Dive ==30~"Northwest Anacapa Island")) %>%
+  mutate(Species = replace(Species,Species =="Adelogorgia", "Adelogorgia phyllosclera"),
+         Species = replace(Species,Species =="Eugorgia","Eugorgia rubens"), 
+         Species = replace(Species,Species =="Acanthogorgia", "Acanthogorgia sp."),
+         Species = replace(Species,Species =="Leptogorgia", "Leptogorgia chilensis"),
+         Species = replace(Species,Species =="Muricea","Muricea fruticosa"), 
+         Species = replace(Species,Species =="Swiftia", "Swiftia pacifica"), 
+         Species = replace(Species,Species =="Paragorgia","Paragorgia arborea"), 
+         Species = replace(Species,Species =="Plumarella","Plumarella longispina"),
+         Species = replace(Species,Species =="Placogorgia","Placogorgia sp."),
+         Species = replace(Species,Species =="Heteropolypus","Heteropolypus ritteri"), 
+         Species = replace(Species,Species =="Funiculina_Halipteris","Pennatulacea"), 
+         Species = replace(Species,Species =="Acanthoptilum","Acanthoptilum gracile"), 
+         Species = replace(Species,Species =="Pennatula", "Pennatula phosphorea"),
+         Species = replace(Species,Species =="Ptilosarcus","Ptilosarcus gurneyi"),
+         Species = replace(Species,Species =="Antipathes","Antipathes dendrochristos"),
+         Species = replace(Species,Species =="Stylaster","Stylaster californicus"),
+         Species = replace(Species,Species =="Lophelia","Lophelia pertusa"),
+         Species = replace(Species,Species =="Desmophyllum","Desmophyllum dianthus"),
+         Species = replace(Species,Species =="Flabellum","Scleractinia"),
+         Species = replace(Species,Species =="Rhizaxinella","Rhizaxinella sp."),
+         Species = replace(Species,Species =="Farrea","Farrea sp.")) %>%
+  filter(IndividualCount > 0) %>%
+  mutate(SampleID=Transect,
+         ScientificName=Species,
+         ObservationDate=as.Date(Date,format ="%m/%d/%Y"),
+         ObservationTime=StartTime,
+         EventID=Dive,
+         SampleAreaInSquareMeters=Final_area,
+         OccurrenceComments = Injury) %>%
+  select(SampleID, ScientificName,VernacularNameCategory, Locality, MinimumDepthInMeters,MaximumDepthInMeters,ObservationDate,ObservationTime,EventID,SampleAreaInSquareMeters,IndividualCount,Density,OccurrenceComments,StartLatitude,StartLongitude,EndLatitude,EndLongitude,Habitat,Temperature) %>%
+  arrange(EventID,SampleID,ScientificName) %>%
+  mutate(OccurrenceComments = ifelse(OccurrenceComments>0, paste(round(OccurrenceComments,2), "percent injured", sep=" "), NA))
+```
+
+## Export submission as a .csv file
+```{r}
+write.csv(submission,"C:\\Users\\elizabeth.gugliotti\\Desktop\\California\\CINMS 2019\\submission.csv", row.names = FALSE)
+write.csv(submission,"C:\\rworking\\CINMS\\data\\submission.csv", row.names = FALSE)
+```
+
+
+### Determining the minimum transect length that you should use
+```{r}
+# 10 m transect minimum
+seg.sub10<-substrate_annotations %>%
+  filter(XYWarea_Midscreen>0) %>%
+  group_by(Dive, Habitat, grp = cumsum(TimeDiff==0)) %>%
+  mutate(cumsum = cumsum(XYWarea_Midscreen)) %>%
+  mutate(modulus = cumsum %% 100) %>%
+  filter(max(modulus)>10) %>%
+  mutate(SumDiff= modulus - lag(modulus, default = first(modulus)))%>%
+  mutate(SumDiff = replace(SumDiff, SumDiff < 0, 0)) %>%
+  group_by(Dive, Habitat, grp, seg = cumsum(SumDiff==0)) %>%
+  select(1:3, DateTime, Habitat, grp, seg, modulus, everything()) %>%
+  filter(max(modulus)>10)
+
+# 20 m transect minimum
+seg.sub20<-substrate_annotations %>%
+  filter(XYWarea_Midscreen>0) %>%
+  group_by(Dive, Habitat, grp = cumsum(TimeDiff==0)) %>%
+  mutate(cumsum = cumsum(XYWarea_Midscreen)) %>%
+  mutate(modulus = cumsum %% 100) %>%
+  filter(max(modulus)>20) %>%
+  mutate(SumDiff= modulus - lag(modulus, default = first(modulus)))%>%
+  mutate(SumDiff = replace(SumDiff, SumDiff < 0, 0)) %>%
+  group_by(Dive, Habitat, grp, seg = cumsum(SumDiff==0)) %>%
+  select(1:3, DateTime, Habitat, grp, seg, modulus, everything()) %>%
+  filter(max(modulus)>20)
+
+# 30 m transect minimum
+seg.sub30<-substrate_annotations %>%
+  filter(XYWarea_Midscreen>0) %>%
+  group_by(Dive, Habitat, grp = cumsum(TimeDiff==0)) %>%
+  mutate(cumsum = cumsum(XYWarea_Midscreen)) %>%
+  mutate(modulus = cumsum %% 100) %>%
+  filter(max(modulus)>30) %>%
+  mutate(SumDiff= modulus - lag(modulus, default = first(modulus)))%>%
+  mutate(SumDiff = replace(SumDiff, SumDiff < 0, 0)) %>%
+  group_by(Dive, Habitat, grp, seg = cumsum(SumDiff==0)) %>%
+  select(1:3, DateTime, Habitat, grp, seg, modulus, everything()) %>%
+  filter(max(modulus)>30)
+
+# 40 m transect minimum
+seg.sub40<-substrate_annotations %>%
+  filter(XYWarea_Midscreen>0) %>%
+  group_by(Dive, Habitat, grp = cumsum(TimeDiff==0)) %>%
+  mutate(cumsum = cumsum(XYWarea_Midscreen)) %>%
+  mutate(modulus = cumsum %% 100) %>%
+  filter(max(modulus)>40) %>%
+  mutate(SumDiff= modulus - lag(modulus, default = first(modulus)))%>%
+  mutate(SumDiff = replace(SumDiff, SumDiff < 0, 0)) %>%
+  group_by(Dive, Habitat, grp, seg = cumsum(SumDiff==0)) %>%
+  select(1:3, DateTime, Habitat, grp, seg, modulus, everything()) %>%
+  filter(max(modulus)>40)
+
+# 50 m transect minimum
+seg.sub50<-substrate_annotations %>%
+  filter(XYWarea_Midscreen>0) %>%
+  group_by(Dive, Habitat, grp = cumsum(TimeDiff==0)) %>%
+  mutate(cumsum = cumsum(XYWarea_Midscreen)) %>%
+  mutate(modulus = cumsum %% 100) %>%
+  filter(max(modulus)>50) %>%
+  mutate(SumDiff= modulus - lag(modulus, default = first(modulus)))%>%
+  mutate(SumDiff = replace(SumDiff, SumDiff < 0, 0)) %>%
+  group_by(Dive, Habitat, grp, seg = cumsum(SumDiff==0)) %>%
+  select(1:3, DateTime, Habitat, grp, seg, modulus, everything()) %>%
+  filter(max(modulus)>50)
+
+# 60 m transect minimum
+seg.sub60<-substrate_annotations %>%
+  filter(XYWarea_Midscreen>0) %>%
+  group_by(Dive, Habitat, grp = cumsum(TimeDiff==0)) %>%
+  mutate(cumsum = cumsum(XYWarea_Midscreen)) %>%
+  mutate(modulus = cumsum %% 100) %>%
+  filter(max(modulus)>60) %>%
+  mutate(SumDiff= modulus - lag(modulus, default = first(modulus)))%>%
+  mutate(SumDiff = replace(SumDiff, SumDiff < 0, 0)) %>%
+  group_by(Dive, Habitat, grp, seg = cumsum(SumDiff==0)) %>%
+  select(1:3, DateTime, Habitat, grp, seg, modulus, everything()) %>%
+  filter(max(modulus)>60)
+
+# 70 m transect minimum
+seg.sub70<-substrate_annotations %>%
+  filter(XYWarea_Midscreen>0) %>%
+  group_by(Dive, Habitat, grp = cumsum(TimeDiff==0)) %>%
+  mutate(cumsum = cumsum(XYWarea_Midscreen)) %>%
+  mutate(modulus = cumsum %% 100) %>%
+  filter(max(modulus)>70) %>%
+  mutate(SumDiff= modulus - lag(modulus, default = first(modulus)))%>%
+  mutate(SumDiff = replace(SumDiff, SumDiff < 0, 0)) %>%
+  group_by(Dive, Habitat, grp, seg = cumsum(SumDiff==0)) %>%
+  select(1:3, DateTime, Habitat, grp, seg, modulus, everything()) %>%
+  filter(max(modulus)>70)
+
+# 80 m transect minimum
+seg.sub80<-substrate_annotations %>%
+  filter(XYWarea_Midscreen>0) %>%
+  group_by(Dive, Habitat, grp = cumsum(TimeDiff==0)) %>%
+  mutate(cumsum = cumsum(XYWarea_Midscreen)) %>%
+  mutate(modulus = cumsum %% 100) %>%
+  filter(max(modulus)>80) %>%
+  mutate(SumDiff= modulus - lag(modulus, default = first(modulus)))%>%
+  mutate(SumDiff = replace(SumDiff, SumDiff < 0, 0)) %>%
+  group_by(Dive, Habitat, grp, seg = cumsum(SumDiff==0)) %>%
+  select(1:3, DateTime, Habitat, grp, seg, modulus, everything()) %>%
+  filter(max(modulus)>80)
+
+# 90 m transect minimum
+seg.sub90<-substrate_annotations %>%
+  filter(XYWarea_Midscreen>0) %>%
+  group_by(Dive, Habitat, grp = cumsum(TimeDiff==0)) %>%
+  mutate(cumsum = cumsum(XYWarea_Midscreen)) %>%
+  mutate(modulus = cumsum %% 100) %>%
+  filter(max(modulus)>90) %>%
+  mutate(SumDiff= modulus - lag(modulus, default = first(modulus)))%>%
+  mutate(SumDiff = replace(SumDiff, SumDiff < 0, 0)) %>%
+  group_by(Dive, Habitat, grp, seg = cumsum(SumDiff==0)) %>%
+  select(1:3, DateTime, Habitat, grp, seg, modulus, everything()) %>%
+  filter(max(modulus)>90)
+
+# Create vectors that will go into a dataframe for the bar plot
+sumsall<-sum(rowSums(substrate_annotations[,c(16,18,20:43)]))
+sums10<-sum(rowSums(seg.sub10[,c(21,23,25:48)]))
+sums20<-sum(rowSums(seg.sub20[,c(21,23,25:48)]))
+sums30<-sum(rowSums(seg.sub30[,c(21,23,25:48)]))
+sums40<-sum(rowSums(seg.sub40[,c(21,23,25:48)]))
+sums50<-sum(rowSums(seg.sub50[,c(21,23,25:48)]))
+sums60<-sum(rowSums(seg.sub60[,c(21,23,25:48)]))
+sums70<-sum(rowSums(seg.sub70[,c(21,23,25:48)]))
+sums80<-sum(rowSums(seg.sub80[,c(21,23,25:48)]))
+sums90<-sum(rowSums(seg.sub90[,c(21,23,25:48)]))
+
+# Create data frame
+all_sums<- c("10" = (sums10/sumsall)*100, "20" = (sums20/sumsall)*100, "30"=(sums30/sumsall)*100,"40"=(sums40/sumsall)*100,"50"=(sums50/sumsall)*100,"60"=(sums60/sumsall)*100,"70"=(sums70/sumsall)*100,"80"=(sums80/sumsall)*100,"90"=(sums90/sumsall)*100)
+
+# Create bar plot to show the number of observations captured out of the total number of observations annotated (as a percent) when the minimum transect length is 10m-90m with lines at 80 & 90%
+barplot(all_sums, space=0, ylab = "% of Total Observed Taxa", xlab = "Minimum Transect Area", ylim = c(0,100))
+abline(h=c(90,80), col = "red", lty = c(1,3)) 
+```
